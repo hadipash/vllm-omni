@@ -9,6 +9,7 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
+from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel_rank, get_pipeline_parallel_world_size
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
@@ -178,6 +179,7 @@ def initialize_model(
         if is_distributed_vae:
             model.vae.set_parallel_size(vae_pp_size)
 
+        _apply_pipefusion_if_enabled(model, od_config)
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
         # at model loading time, not inside individual model files
@@ -252,6 +254,54 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
     except Exception as e:
         logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
+
+
+def _apply_pipefusion_if_enabled(model, od_config: OmniDiffusionConfig, block_name: str = "blocks") -> None:
+    """Apply sequence parallelism hooks if SP is enabled.
+
+    This is the centralized location for enabling SP, similar to diffusers'
+    ModelMixin.enable_parallelism() method. It applies _sp_plan hooks to
+    transformer models that define them.
+
+    Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+    We use _sp_plan instead of diffusers' _cp_plan.
+
+    Args:
+        model: The pipeline model (e.g., ZImagePipeline).
+        od_config: The OmniDiffusion configuration.
+    """
+
+    try:
+        pp_size = od_config.parallel_config.pipeline_parallel_size
+        if pp_size <= 1:
+            return
+
+        transformer = model.transformer
+
+        # transformer layer split
+        pp_rank = get_pipeline_parallel_rank()
+        pp_world_size = get_pipeline_parallel_world_size()
+        blocks_list = {block_name: getattr(transformer, block_name)}
+
+        num_blocks_list = [len(blocks) for blocks in blocks_list.values()]
+        num_blocks_per_stage = sum(num_blocks_list) // pp_world_size
+        remainder = sum(num_blocks_list) % pp_world_size
+        # give more blocks to the later stages as the first stage usually has more processing to do
+        stage_block_start_idx = pp_rank * num_blocks_per_stage + max(0, pp_rank - (pp_world_size - remainder))
+        stage_block_end_idx = (pp_rank + 1) * num_blocks_per_stage + max(0, (pp_rank + 1) - (pp_world_size - remainder))
+
+        setattr(transformer, block_name, blocks_list[block_name][stage_block_start_idx:stage_block_end_idx])
+
+        # Store the layer offset for weight loading
+        transformer.pp_layer_offset = stage_block_start_idx
+        transformer.pp_num_layers = stage_block_end_idx - stage_block_start_idx
+        logger.info(
+            f"PP rank {pp_rank}: assigned layers {stage_block_start_idx}-{stage_block_end_idx - 1} "
+            f"(offset={stage_block_start_idx}, local_layers={transformer.pp_num_layers})"
+        )
+
+    except Exception as e:
+        logger.warning(f"Failed to apply PipeFusion: {e}. Continuing without PipeFusion.")
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

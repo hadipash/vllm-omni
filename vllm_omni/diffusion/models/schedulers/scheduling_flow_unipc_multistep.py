@@ -23,6 +23,7 @@ from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, Sch
 from diffusers.utils import deprecate
 
 from vllm_omni.diffusion.models.schedulers.base import BaseScheduler
+from vllm_omni.diffusion.models.wan2_2.runtime import get_runtime_state
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
@@ -124,6 +125,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         self._begin_index: int | None = None
         self.this_order: int = 1
 
+        # Per-patch caches for async pipeline parallelism
+        self._patch_model_outputs: list[list[torch.Tensor | None]] | None = None
+        self._patch_last_sample: list[torch.Tensor | None] | None = None
+
         # Move sigmas to CPU to reduce GPU/CPU communication
         self.sigmas = self.sigmas.to("cpu")
         self.sigma_min = self.sigmas[-1].item()
@@ -153,6 +158,43 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             begin_index (`int`): The begin index for the scheduler.
         """
         self._begin_index = begin_index
+
+    def split_caches_for_patches(self, patch_heights: list[int], dim: int = -2) -> None:
+        """
+        Split cached model_outputs and last_sample into per-patch versions for async pipeline.
+
+        This should be called when transitioning from sync to async pipeline mode.
+        The full-size cached tensors are split along the specified dimension.
+
+        Args:
+            patch_heights: List of heights for each patch (sum should equal full height).
+            dim: Dimension along which to split (default -2 for height dimension).
+        """
+        num_patches = get_runtime_state().num_pipeline_patch
+
+        # Split model_outputs
+        self._patch_model_outputs = []
+        for patch_idx in range(num_patches):
+            patch_outputs: list[torch.Tensor | None] = []
+            for model_output in self.model_outputs:
+                if model_output is not None:
+                    splits = model_output.split(patch_heights, dim=dim)
+                    patch_outputs.append(splits[patch_idx])
+                else:
+                    patch_outputs.append(None)
+            self._patch_model_outputs.append(patch_outputs)
+
+        # Split last_sample
+        if self.last_sample is not None:
+            splits = self.last_sample.split(patch_heights, dim=dim)
+            self._patch_last_sample = list(splits)
+        else:
+            self._patch_last_sample = [None] * num_patches
+
+    def clear_patch_caches(self) -> None:
+        """Clear per-patch caches when exiting async pipeline mode."""
+        self._patch_model_outputs = None
+        self._patch_last_sample = None
 
     def set_timesteps(
         self,
@@ -635,6 +677,16 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if self.step_index is None:
             self._init_step_index(timestep)
 
+        # In patch-wise pipeline parallelism, swap to current patch's caches
+        runtime_state = get_runtime_state()
+        patch_mode = runtime_state.patch_mode
+        patch_idx = runtime_state.pipeline_patch_idx if patch_mode else 0
+        is_last_patch = not patch_mode or patch_idx == runtime_state.num_pipeline_patch - 1
+
+        if patch_mode and self._patch_model_outputs is not None:
+            self.model_outputs = self._patch_model_outputs[patch_idx]
+            self.last_sample = self._patch_last_sample[patch_idx] if self._patch_last_sample else None
+
         use_corrector = (
             self.step_index > 0 and self.step_index - 1 not in self.disable_corrector and self.last_sample is not None
         )
@@ -649,13 +701,16 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 order=self.this_order,
             )
 
-        # Update model output history
+        # Update model output history (per-patch via list reference)
         for i in range(self.config.solver_order - 1):
             self.model_outputs[i] = self.model_outputs[i + 1]
-            self.timestep_list[i] = self.timestep_list[i + 1]
+            # Only shift timestep_list on first patch (it's shared, not per-patch)
+            if patch_idx == 0:
+                self.timestep_list[i] = self.timestep_list[i + 1]
 
         self.model_outputs[-1] = model_output_convert
-        self.timestep_list[-1] = timestep
+        if patch_idx == 0:
+            self.timestep_list[-1] = timestep
 
         # Determine order for this step
         if self.config.lower_order_final:
@@ -663,21 +718,28 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         else:
             this_order = self.config.solver_order
 
-        self.this_order = min(this_order, self.lower_order_nums + 1)  # warmup for multistep
-        assert self.this_order > 0
+        this_order = min(this_order, self.lower_order_nums + 1)  # warmup for multistep
+        assert this_order > 0
 
+        # Update last_sample - must explicitly update per-patch cache since assignment rebinds
+        if patch_mode and self._patch_last_sample is not None:
+            self._patch_last_sample[patch_idx] = sample
         self.last_sample = sample
         prev_sample = self.multistep_uni_p_bh_update(
             model_output=model_output,
             sample=sample,
-            order=self.this_order,
+            order=this_order,
         )
 
-        if self.lower_order_nums < self.config.solver_order:
-            self.lower_order_nums += 1
+        # Update timestep-level state only on the last pipeline patch
+        if is_last_patch:
+            self.this_order = this_order
 
-        assert self._step_index is not None
-        self._step_index += 1
+            if self.lower_order_nums < self.config.solver_order:
+                self.lower_order_nums += 1
+
+            assert self._step_index is not None
+            self._step_index += 1
 
         if not return_dict:
             return (prev_sample,)

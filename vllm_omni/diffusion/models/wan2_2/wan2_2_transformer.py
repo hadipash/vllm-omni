@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -18,16 +19,15 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.conv import Conv3dLayer
+from vllm.model_executor.layers.conv import Conv3dLayer as Conv3dLayerVLLM
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,
-    SequenceParallelOutput,
-)
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.models.wan2_2.runtime import get_runtime_state
 from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
@@ -56,6 +56,53 @@ def apply_rotary_emb_wan(
     out[..., 0::2] = x1 * cos - x2 * sin
     out[..., 1::2] = x1 * sin + x2 * cos
     return out.type_as(hidden_states)
+
+
+class Conv3dLayer(Conv3dLayerVLLM):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.activation_cache = None
+
+    def sliced_forward(self, x: torch.Tensor, start, end) -> torch.Tensor:
+        b, c, t, h, w = x.shape
+        pad_t, pad_h, pad_w = self.padding
+
+        h_begin = max(0, start - pad_h)
+        h_end = min(h, end + pad_h)
+
+        pad_top = pad_h if h_begin == 0 else 0
+        pad_bottom = pad_h if h_end == h else 0
+
+        sliced_input = x[:, :, :, h_begin:h_end, :]
+        padded_input = F.pad(sliced_input, (pad_w, pad_w, pad_top, pad_bottom, pad_t, pad_t), mode="constant")
+
+        return F.conv3d(
+            padded_input,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding="valid",
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+
+    def forward(self, x: torch.Tensor, dims) -> torch.Tensor:
+        if (
+            not get_runtime_state().patch_mode
+            or get_runtime_state().num_pipeline_patch == 1
+            or self.kernel_size == (1, 1)
+            or self.kernel_size == 1
+        ):
+            output = super().forward(x)
+        else:
+            if self.activation_cache is None:
+                self.activation_cache = torch.zeros(dims, dtype=x.dtype, device=x.device)
+
+            start, end = get_runtime_state().pp_patches_start_end_idx[get_runtime_state().pipeline_patch_idx]
+            self.activation_cache[:, :, :, start:end, :] = x
+            output = self.sliced_forward(self.activation_cache, start, end)
+
+        return output
 
 
 class DistributedRMSNorm(nn.Module):
@@ -196,8 +243,7 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_sin = freqs.sin().float().repeat_interleave(2, dim=-1)
         return freqs_cos.float(), freqs_sin.float()
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+    def forward(self, num_frames: int, height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
         p_t, p_h, p_w = self.patch_size
         ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
 
@@ -393,6 +439,8 @@ class WanSelfAttention(nn.Module):
             causal=False,
         )
 
+        self.full_k, self.full_v = None, None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -420,6 +468,15 @@ class WanSelfAttention(nn.Module):
             freqs_cos, freqs_sin = rotary_emb
             query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
             key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
+
+        if get_runtime_state().patch_mode:
+            start, end = get_runtime_state().pp_patches_token_start_end_idx[get_runtime_state().pipeline_patch_idx]
+            self.full_k[:, start:end] = key
+            self.full_v[:, start:end] = value
+            key, value = self.full_k, self.full_v
+        else:
+            self.full_k = key
+            self.full_v = value
 
         # Create attention metadata if mask is provided
         attn_metadata = None
@@ -868,20 +925,32 @@ class WanTransformer3DModel(nn.Module):
         encoder_hidden_states_image: torch.Tensor | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        dims: tuple[int, int, int, int, int] = None,
     ) -> torch.Tensor | Transformer2DModelOutput:
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        batch_size, _, num_frames, height, width = dims
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
-        post_patch_height = height // p_h
+        # FIXME
+        if get_runtime_state().patch_mode:
+            post_patch_height = get_runtime_state().pp_patches_height[get_runtime_state().pipeline_patch_idx] // p_h
+        else:
+            post_patch_height = height // p_h
         post_patch_width = width // p_w
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
-        rotary_emb = self.rope(hidden_states)
+        rotary_emb = self.rope(*dims[-3:])
+        # FIXME
+        if get_runtime_state().patch_mode:
+            rotary_emb = tuple(
+                re.split(get_runtime_state().pp_patches_token_num, dim=-3)[get_runtime_state().pipeline_patch_idx]
+                for re in rotary_emb
+            )
 
-        # Patch embedding and flatten to sequence
-        # (hidden_states is sharded at blocks.0 input by _sp_plan)
-        hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        if is_pipeline_first_stage():
+            # Patch embedding and flatten to sequence
+            # (hidden_states is sharded at blocks.0 input by _sp_plan)
+            hidden_states = self.patch_embedding(hidden_states, dims)
+            hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # Handle timestep shape
         if timestep.ndim == 2:
@@ -928,22 +997,25 @@ class WanTransformer3DModel(nn.Module):
         for block in self.blocks:
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
 
-        # Output norm, projection & unpatchify
-        shift, scale = self.output_scale_shift_prepare(temb)
-        shift = shift.to(hidden_states.device)
-        scale = scale.to(hidden_states.device)
-        if shift.ndim == 2:  # T2V mode: unsqueeze for broadcasting
-            shift = shift.unsqueeze(1)
-            scale = scale.unsqueeze(1)
+        if is_pipeline_last_stage():
+            # Output norm, projection & unpatchify
+            shift, scale = self.output_scale_shift_prepare(temb)
+            shift = shift.to(hidden_states.device)
+            scale = scale.to(hidden_states.device)
+            if shift.ndim == 2:  # T2V mode: unsqueeze for broadcasting
+                shift = shift.unsqueeze(1)
+                scale = scale.unsqueeze(1)
 
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
-        hidden_states = self.proj_out(hidden_states)
+            hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+            hidden_states = self.proj_out(hidden_states)
 
-        hidden_states = hidden_states.reshape(
-            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
-        )
-        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+            hidden_states = hidden_states.reshape(
+                batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+            )
+            hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+            output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        else:
+            output = hidden_states
 
         if not return_dict:
             return (output,)
@@ -981,8 +1053,28 @@ class WanTransformer3DModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        # Get pipeline parallel layer offset if it exists
+        pp_layer_offset = getattr(self, "pp_layer_offset", 0)
+        pp_num_layers = getattr(self, "pp_num_layers", None)
+
         for name, loaded_weight in weights:
             name = weight_name_remapping.get(name, name)
+
+            # Remap checkpoint layer index to local layer index for pipeline parallel
+            # Example: checkpoint has "blocks.15.xxx", rank 1 has offset=15, local index should be "blocks.0.xxx"
+            if pp_num_layers is not None:  # Pipeline parallel is enabled
+                match = re.match(r"blocks\.(\d+)\.(.*)", name)
+                if match:
+                    global_layer_idx = int(match.group(1))
+                    local_layer_idx = global_layer_idx - pp_layer_offset
+
+                    # Skip if this layer doesn't belong to this rank
+                    if local_layer_idx < 0 or local_layer_idx >= pp_num_layers:
+                        continue
+
+                    # Remap to local index
+                    name = f"blocks.{local_layer_idx}.{match.group(2)}"
+
             original_name = name
             lookup_name = name
 
