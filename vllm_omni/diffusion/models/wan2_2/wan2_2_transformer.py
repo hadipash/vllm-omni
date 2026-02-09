@@ -63,20 +63,37 @@ class Conv3dLayer(Conv3dLayerVLLM):
         super().__init__(*args, **kwargs)
         self.activation_cache = None
 
-    def sliced_forward(self, x: torch.Tensor, start, end) -> torch.Tensor:
+    def sliced_forward(self, x: torch.Tensor, start, end, out_start, out_end) -> torch.Tensor:
+        """
+        Compute convolution on a slice of the input that produces output for [out_start:out_end].
+
+        Args:
+            x: Full input tensor with all patches cached
+            start, end: Input slice range (latent space)
+            out_start, out_end: Output slice range (post-patch space)
+        """
         b, c, t, h, w = x.shape
         pad_t, pad_h, pad_w = self.padding
+        stride_h = self.stride[1] if isinstance(self.stride, tuple) else self.stride
 
-        h_begin = max(0, start - pad_h)
-        h_end = min(h, end + pad_h)
+        # Calculate input range needed to produce output [out_start:out_end]
+        # For strided conv: out_pos = (in_pos + pad - kernel_size) // stride + 1
+        # Inverse: in_pos = out_pos * stride - pad (approximately)
+        in_start = out_start * stride_h
+        in_end = (out_end - 1) * stride_h + self.kernel_size[1]  # Need full kernel for last output
 
-        pad_top = pad_h if h_begin == 0 else 0
-        pad_bottom = pad_h if h_end == h else 0
+        # Expand to include padding context from neighbors
+        h_begin = max(0, in_start - pad_h)
+        h_end = min(h, in_end + pad_h)
+
+        # Determine padding needed at boundaries
+        pad_top = max(0, pad_h - in_start) if h_begin == 0 else 0
+        pad_bottom = max(0, in_end + pad_h - h) if h_end == h else 0
 
         sliced_input = x[:, :, :, h_begin:h_end, :]
         padded_input = F.pad(sliced_input, (pad_w, pad_w, pad_top, pad_bottom, pad_t, pad_t), mode="constant")
 
-        return F.conv3d(
+        output = F.conv3d(
             padded_input,
             self.weight,
             self.bias,
@@ -85,6 +102,14 @@ class Conv3dLayer(Conv3dLayerVLLM):
             dilation=self.dilation,
             groups=self.groups,
         )
+
+        # Extract only the output rows we need (in case we computed extra)
+        expected_out_height = out_end - out_start
+        if output.shape[3] > expected_out_height:
+            # Trim to expected output height
+            output = output[:, :, :, :expected_out_height, :]
+
+        return output
 
     def forward(self, x: torch.Tensor, dims) -> torch.Tensor:
         if (
@@ -98,9 +123,11 @@ class Conv3dLayer(Conv3dLayerVLLM):
             if self.activation_cache is None:
                 self.activation_cache = torch.zeros(dims, dtype=x.dtype, device=x.device)
 
-            start, end = get_runtime_state().pp_patches_start_end_idx[get_runtime_state().pipeline_patch_idx]
+            patch_idx = get_runtime_state().pipeline_patch_idx
+            start, end = get_runtime_state().pp_patches_start_end_idx[patch_idx]
+            out_start, out_end = get_runtime_state().pp_patches_post_start_end_idx[patch_idx]
             self.activation_cache[:, :, :, start:end, :] = x
-            output = self.sliced_forward(self.activation_cache, start, end)
+            output = self.sliced_forward(self.activation_cache, start, end, out_start, out_end)
 
         return output
 
@@ -930,21 +957,36 @@ class WanTransformer3DModel(nn.Module):
         batch_size, _, num_frames, height, width = dims
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
-        # FIXME
         if get_runtime_state().patch_mode:
-            post_patch_height = get_runtime_state().pp_patches_height[get_runtime_state().pipeline_patch_idx] // p_h
+            post_patch_height = get_runtime_state().pp_patches_post_height[get_runtime_state().pipeline_patch_idx]
         else:
             post_patch_height = height // p_h
         post_patch_width = width // p_w
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
         rotary_emb = self.rope(*dims[-3:])
-        # FIXME
         if get_runtime_state().patch_mode:
-            rotary_emb = tuple(
-                re.split(get_runtime_state().pp_patches_token_num, dim=-3)[get_runtime_state().pipeline_patch_idx]
-                for re in rotary_emb
-            )
+            # Split RoPE along height dimension to match patch splitting
+            # RoPE shape: [1, ppf * pph * ppw, 1, dim] -> reshape to [ppf, pph, ppw, dim]
+            # then split along pph (height) dimension, then reshape back
+            p_t, p_h, p_w = self.config.patch_size
+            ppf = dims[2] // p_t  # post-patch frames
+            pph = dims[3] // p_h  # post-patch height (full)
+            ppw = dims[4] // p_w  # post-patch width
+
+            # Use pre-calculated post-patch heights from runtime state
+            pp_heights = get_runtime_state().pp_patches_post_height
+            patch_idx = get_runtime_state().pipeline_patch_idx
+
+            def split_rope(re):
+                # [1, ppf*pph*ppw, 1, dim] -> [ppf, pph, ppw, dim]
+                re = re.reshape(ppf, pph, ppw, -1)
+                # Split along height (dim=1) and select current patch
+                re = re.split(pp_heights, dim=1)[patch_idx]
+                # Reshape back to [1, seq, 1, dim]
+                return re.reshape(1, -1, 1, re.shape[-1])
+
+            rotary_emb = tuple(split_rope(re) for re in rotary_emb)
 
         if is_pipeline_first_stage():
             # Patch embedding and flatten to sequence

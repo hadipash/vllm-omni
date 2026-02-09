@@ -52,10 +52,34 @@ class DiTRuntimeState:
 
     def _calc_patches_metadata(self, latents):
         self.num_pipeline_patch = get_pipeline_parallel_world_size()
-        self.pp_patches_height, self.pp_patches_start_end_idx = self._calc_patch_metadata(latents.size(-2))
-        # FIXME: patch size
-        seq_length = latents.size(-1) // 2 * latents.size(-2) // 2 * latents.size(-3)
-        self.pp_patches_token_num, self.pp_patches_token_start_end_idx = self._calc_patch_metadata(seq_length)
+
+        # FIXME: patch size hardcoded as (1, 2, 2)
+        p_t, p_h, p_w = 1, 2, 2
+        ppf = latents.size(-3) // p_t  # post-patch frames
+        pph = latents.size(-2) // p_h  # post-patch height (full)
+        ppw = latents.size(-1) // p_w  # post-patch width
+
+        # Calculate post-patch heights first (split pph among patches)
+        self.pp_patches_post_height, self.pp_patches_post_start_end_idx = self._calc_patch_metadata(pph)
+
+        # Derive latent-space heights from post-patch heights (multiply by p_h)
+        # This ensures each latent patch height is divisible by p_h
+        self.pp_patches_height = [h * p_h for h in self.pp_patches_post_height]
+        start = 0
+        self.pp_patches_start_end_idx = []
+        for h in self.pp_patches_height:
+            self.pp_patches_start_end_idx.append((start, start + h))
+            start += h
+
+        # Token count for each patch based on its post-patch height
+        self.pp_patches_token_num = [h * ppw * ppf for h in self.pp_patches_post_height]
+
+        # Calculate start/end indices for each patch's tokens
+        start = 0
+        self.pp_patches_token_start_end_idx = []
+        for num in self.pp_patches_token_num:
+            self.pp_patches_token_start_end_idx.append((start, start + num))
+            start += num
 
     def _reset_recv_buffer(self, dtype):
         get_pp_group().reset_buffer()
