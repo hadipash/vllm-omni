@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -25,9 +24,12 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
+from vllm_omni.diffusion.distributed.pipefusion_transformer import (
+    PipeFusionConv3dMixin,
+    PipeFusionSelfAttentionMixin,
+    PipeFusionTransformerMixin,
+)
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
-from vllm_omni.diffusion.models.wan2_2.runtime import get_runtime_state
 from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
@@ -58,78 +60,11 @@ def apply_rotary_emb_wan(
     return out.type_as(hidden_states)
 
 
-class Conv3dLayer(Conv3dLayerVLLM):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.activation_cache = None
-
-    def sliced_forward(self, x: torch.Tensor, start, end, out_start, out_end) -> torch.Tensor:
-        """
-        Compute convolution on a slice of the input that produces output for [out_start:out_end].
-
-        Args:
-            x: Full input tensor with all patches cached
-            start, end: Input slice range (latent space)
-            out_start, out_end: Output slice range (post-patch space)
-        """
-        b, c, t, h, w = x.shape
-        pad_t, pad_h, pad_w = self.padding
-        stride_h = self.stride[1] if isinstance(self.stride, tuple) else self.stride
-
-        # Calculate input range needed to produce output [out_start:out_end]
-        # For strided conv: out_pos = (in_pos + pad - kernel_size) // stride + 1
-        # Inverse: in_pos = out_pos * stride - pad (approximately)
-        in_start = out_start * stride_h
-        in_end = (out_end - 1) * stride_h + self.kernel_size[1]  # Need full kernel for last output
-
-        # Expand to include padding context from neighbors
-        h_begin = max(0, in_start - pad_h)
-        h_end = min(h, in_end + pad_h)
-
-        # Determine padding needed at boundaries
-        pad_top = max(0, pad_h - in_start) if h_begin == 0 else 0
-        pad_bottom = max(0, in_end + pad_h - h) if h_end == h else 0
-
-        sliced_input = x[:, :, :, h_begin:h_end, :]
-        padded_input = F.pad(sliced_input, (pad_w, pad_w, pad_top, pad_bottom, pad_t, pad_t), mode="constant")
-
-        output = F.conv3d(
-            padded_input,
-            self.weight,
-            self.bias,
-            stride=self.stride,
-            padding="valid",
-            dilation=self.dilation,
-            groups=self.groups,
-        )
-
-        # Extract only the output rows we need (in case we computed extra)
-        expected_out_height = out_end - out_start
-        if output.shape[3] > expected_out_height:
-            # Trim to expected output height
-            output = output[:, :, :, :expected_out_height, :]
-
-        return output
-
+class Conv3dLayer(Conv3dLayerVLLM, PipeFusionConv3dMixin):
     def forward(self, x: torch.Tensor, dims) -> torch.Tensor:
-        if (
-            not get_runtime_state().patch_mode
-            or get_runtime_state().num_pipeline_patch == 1
-            or self.kernel_size == (1, 1)
-            or self.kernel_size == 1
-        ):
-            output = super().forward(x)
-        else:
-            if self.activation_cache is None:
-                self.activation_cache = torch.zeros(dims, dtype=x.dtype, device=x.device)
-
-            patch_idx = get_runtime_state().pipeline_patch_idx
-            start, end = get_runtime_state().pp_patches_start_end_idx[patch_idx]
-            out_start, out_end = get_runtime_state().pp_patches_post_start_end_idx[patch_idx]
-            self.activation_cache[:, :, :, start:end, :] = x
-            output = self.sliced_forward(self.activation_cache, start, end, out_start, out_end)
-
-        return output
+        if self.pipefusion_conv3d_enabled():
+            return self.pipefusion_conv3d_forward(x, dims)
+        return super().forward(x)
 
 
 class DistributedRMSNorm(nn.Module):
@@ -412,7 +347,7 @@ class OutputScaleShiftPrepare(nn.Module):
         return shift, scale
 
 
-class WanSelfAttention(nn.Module):
+class WanSelfAttention(nn.Module, PipeFusionSelfAttentionMixin):
     """
     Optimized self-attention module using vLLM layers.
     """
@@ -496,14 +431,8 @@ class WanSelfAttention(nn.Module):
             query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
             key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
-        if get_runtime_state().patch_mode:
-            start, end = get_runtime_state().pp_patches_token_start_end_idx[get_runtime_state().pipeline_patch_idx]
-            self.full_k[:, start:end] = key
-            self.full_v[:, start:end] = value
-            key, value = self.full_k, self.full_v
-        else:
-            self.full_k = key
-            self.full_v = value
+        # PipeFusion: update KV cache for patch-wise execution
+        key, value = self.pipefusion_update_kv_cache(key, value)
 
         # Create attention metadata if mask is provided
         attn_metadata = None
@@ -768,7 +697,7 @@ class WanTransformerBlock(nn.Module):
         return hidden_states
 
 
-class WanTransformer3DModel(nn.Module):
+class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
     """
     Optimized Wan Transformer model for video generation using vLLM layers.
 
@@ -957,38 +886,15 @@ class WanTransformer3DModel(nn.Module):
         batch_size, _, num_frames, height, width = dims
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
-        if get_runtime_state().patch_mode:
-            post_patch_height = get_runtime_state().pp_patches_post_height[get_runtime_state().pipeline_patch_idx]
-        else:
-            post_patch_height = height // p_h
+        post_patch_height = self.pipefusion_get_post_patch_height(height, p_h)
         post_patch_width = width // p_w
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
         rotary_emb = self.rope(*dims[-3:])
-        if get_runtime_state().patch_mode:
-            # Split RoPE along height dimension to match patch splitting
-            # RoPE shape: [1, ppf * pph * ppw, 1, dim] -> reshape to [ppf, pph, ppw, dim]
-            # then split along pph (height) dimension, then reshape back
-            p_t, p_h, p_w = self.config.patch_size
-            ppf = dims[2] // p_t  # post-patch frames
-            pph = dims[3] // p_h  # post-patch height (full)
-            ppw = dims[4] // p_w  # post-patch width
+        # PipeFusion: slice RoPE for the current patch
+        rotary_emb = self.pipefusion_slice_rotary_emb(rotary_emb, dims, self.config.patch_size)
 
-            # Use pre-calculated post-patch heights from runtime state
-            pp_heights = get_runtime_state().pp_patches_post_height
-            patch_idx = get_runtime_state().pipeline_patch_idx
-
-            def split_rope(re):
-                # [1, ppf*pph*ppw, 1, dim] -> [ppf, pph, ppw, dim]
-                re = re.reshape(ppf, pph, ppw, -1)
-                # Split along height (dim=1) and select current patch
-                re = re.split(pp_heights, dim=1)[patch_idx]
-                # Reshape back to [1, seq, 1, dim]
-                return re.reshape(1, -1, 1, re.shape[-1])
-
-            rotary_emb = tuple(split_rope(re) for re in rotary_emb)
-
-        if is_pipeline_first_stage():
+        if self.pipefusion_should_patch_embed():
             # Patch embedding and flatten to sequence
             # (hidden_states is sharded at blocks.0 input by _sp_plan)
             hidden_states = self.patch_embedding(hidden_states, dims)
@@ -1039,7 +945,7 @@ class WanTransformer3DModel(nn.Module):
         for block in self.blocks:
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
 
-        if is_pipeline_last_stage():
+        if self.pipefusion_should_output_project():
             # Output norm, projection & unpatchify
             shift, scale = self.output_scale_shift_prepare(temb)
             shift = shift.to(hidden_states.device)
@@ -1095,27 +1001,13 @@ class WanTransformer3DModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        # Get pipeline parallel layer offset if it exists
-        pp_layer_offset = getattr(self, "pp_layer_offset", 0)
-        pp_num_layers = getattr(self, "pp_num_layers", None)
-
         for name, loaded_weight in weights:
             name = weight_name_remapping.get(name, name)
 
-            # Remap checkpoint layer index to local layer index for pipeline parallel
-            # Example: checkpoint has "blocks.15.xxx", rank 1 has offset=15, local index should be "blocks.0.xxx"
-            if pp_num_layers is not None:  # Pipeline parallel is enabled
-                match = re.match(r"blocks\.(\d+)\.(.*)", name)
-                if match:
-                    global_layer_idx = int(match.group(1))
-                    local_layer_idx = global_layer_idx - pp_layer_offset
-
-                    # Skip if this layer doesn't belong to this rank
-                    if local_layer_idx < 0 or local_layer_idx >= pp_num_layers:
-                        continue
-
-                    # Remap to local index
-                    name = f"blocks.{local_layer_idx}.{match.group(2)}"
+            # PipeFusion: remap checkpoint block index to local index for pipeline parallel
+            name = self.pipefusion_remap_block_weights(name)
+            if name is None:
+                continue
 
             original_name = name
             lookup_name = name

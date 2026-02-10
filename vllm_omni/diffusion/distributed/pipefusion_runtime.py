@@ -18,7 +18,8 @@ class DiTRuntimeState:
     pp_patches_token_num: list[int] | None
     pp_patches_token_start_end_idx: list[tuple[int, int]] | None
 
-    def __init__(self, warmup_steps: int = 1):
+    def __init__(self, patch_size: tuple[int, int, int] = (1, 2, 2), warmup_steps: int = 1):
+        self.patch_size = patch_size
         self.patch_mode = False
         self.pipeline_patch_idx = 0
         self.warmup_steps = warmup_steps
@@ -53,8 +54,7 @@ class DiTRuntimeState:
     def _calc_patches_metadata(self, latents):
         self.num_pipeline_patch = get_pipeline_parallel_world_size()
 
-        # FIXME: patch size hardcoded as (1, 2, 2)
-        p_t, p_h, p_w = 1, 2, 2
+        p_t, p_h, p_w = self.patch_size
         ppf = latents.size(-3) // p_t  # post-patch frames
         pph = latents.size(-2) // p_h  # post-patch height (full)
         ppw = latents.size(-1) // p_w  # post-patch width
@@ -86,11 +86,11 @@ class DiTRuntimeState:
         get_pp_group().set_config(dtype)
 
 
-def initialize_runtime_state():
+def initialize_runtime_state(patch_size: tuple[int, int, int] = (1, 2, 2)):
     global _RUNTIME
     if _RUNTIME is not None:
         logger.warning("Runtime state is already initialized, reinitializing with pipeline...")
-    _RUNTIME = DiTRuntimeState()
+    _RUNTIME = DiTRuntimeState(patch_size=patch_size)
 
 
 def get_runtime_state():

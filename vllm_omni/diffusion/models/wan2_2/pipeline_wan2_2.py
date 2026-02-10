@@ -21,15 +21,14 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
-    get_pp_group,
     is_dp_last_group,
     is_pipeline_first_stage,
-    is_pipeline_last_stage,
 )
+from vllm_omni.diffusion.distributed.pipefusion import PipeFusionPipelineMixin
+from vllm_omni.diffusion.distributed.pipefusion_runtime import get_runtime_state, initialize_runtime_state
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
-from vllm_omni.diffusion.models.wan2_2.runtime import get_runtime_state, initialize_runtime_state
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
@@ -194,7 +193,7 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module, CFGParallelMixin):
+class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
     def __init__(
         self,
         *,
@@ -316,7 +315,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         self._num_timesteps = None
         self._current_timestep = None
 
-        initialize_runtime_state()
+        initialize_runtime_state(patch_size=self.transformer_config.patch_size)
 
     @property
     def guidance_scale(self):
@@ -561,56 +560,62 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         # FIXME: merge it with the runtime state
         self.scheduler.clear_patch_caches()
 
-        # Denoising
+        # Denoising via PipeFusion mixin
         num_pipeline_warmup_steps = get_runtime_state().warmup_steps
         # Store original latent dimensions for consistent transformer input across all PP ranks
         # After patch_embedding on first rank, latents become [B, seq, dim], but transformer
         # needs original [B, C, T, H, W] dims to compute post_patch dimensions correctly
         original_dims = latents.shape
+
+        # Guidance selection callbacks for PipeFusion
+        def _select_guidance(t):
+            if boundary_timestep is not None and t < boundary_timestep:
+                return guidance_high
+            return guidance_low
+
+        def do_true_cfg_fn(t):
+            return _select_guidance(t) > 1.0 and negative_prompt_embeds is not None
+
+        def guidance_scale_fn(t):
+            return _select_guidance(t)
+
+        # Extra kwargs passed through to prepare_pipefusion_noise_kwargs
+        extra_kwargs = dict(
+            attention_kwargs=attention_kwargs,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            original_dims=original_dims,
+            boundary_timestep=boundary_timestep,
+            latent_condition=latent_condition,
+            first_frame_mask=first_frame_mask,
+        )
+
         if get_pipeline_parallel_world_size() > 1 and len(timesteps) > num_pipeline_warmup_steps:
-            latents = self._sync_pipeline(
-                attention_kwargs,
-                boundary_timestep,
-                dtype,
-                first_frame_mask,
-                guidance_high,
-                guidance_low,
-                latent_condition,
-                latents,
-                negative_prompt_embeds,
-                prompt_embeds,
-                timesteps[:num_pipeline_warmup_steps],
-                original_dims,
+            latents = self.pipefusion_sync_pipeline(
+                timesteps=timesteps[:num_pipeline_warmup_steps],
+                latents=latents,
+                dtype=dtype,
+                do_true_cfg_fn=do_true_cfg_fn,
+                guidance_scale_fn=guidance_scale_fn,
+                **extra_kwargs,
             )
-            latents = self._async_pipeline(
-                attention_kwargs,
-                boundary_timestep,
-                dtype,
-                first_frame_mask,
-                guidance_high,
-                guidance_low,
-                latent_condition,
-                latents,
-                negative_prompt_embeds,
-                prompt_embeds,
-                timesteps[num_pipeline_warmup_steps:],
-                original_dims,
+            latents = self.pipefusion_async_pipeline(
+                timesteps=timesteps[num_pipeline_warmup_steps:],
+                latents=latents,
+                dtype=dtype,
+                do_true_cfg_fn=do_true_cfg_fn,
+                guidance_scale_fn=guidance_scale_fn,
+                **extra_kwargs,
             )
         else:
-            latents = self._sync_pipeline(
-                attention_kwargs,
-                boundary_timestep,
-                dtype,
-                first_frame_mask,
-                guidance_high,
-                guidance_low,
-                latent_condition,
-                latents,
-                negative_prompt_embeds,
-                prompt_embeds,
-                timesteps[num_pipeline_warmup_steps:],
-                original_dims,
+            latents = self.pipefusion_sync_pipeline(
+                timesteps=timesteps,
+                latents=latents,
+                dtype=dtype,
+                do_true_cfg_fn=do_true_cfg_fn,
+                guidance_scale_fn=guidance_scale_fn,
                 sync_only=True,
+                **extra_kwargs,
             )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
@@ -643,36 +648,79 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
                 output = self.vae.decode(latents, return_dict=False)[0]
 
         # Send output from last rank to first rank for pipeline parallel
-        if get_pipeline_parallel_world_size() > 1:
-            if is_pipeline_last_stage():
-                # Last rank sends output to first rank
-                get_pp_group().send_tensor_dict({"output": output}, dst=0)
-            elif is_pipeline_first_stage():
-                # First rank receives output from last rank
-                output_dict = get_pp_group().recv_tensor_dict(src=get_pipeline_parallel_world_size() - 1)
-                output = output_dict["output"]
+        output = self.pipefusion_send_output_to_first_rank(output)
 
         return DiffusionOutput(output=output)
 
-    def combine_cfg_noise(
-        self, noise_pred: torch.Tensor, neg_noise_pred: torch.Tensor, true_cfg_scale: float, cfg_normalize: bool = False
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def prepare_pipefusion_noise_kwargs(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        do_true_cfg: bool,
+        noise_uncond: torch.Tensor | None,
+        **extra_kwargs: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """
-        Combine conditional and unconditional noise predictions with CFG.
+        Prepare positive and negative kwargs for noise prediction.
 
-        Args:
-            noise_pred: Conditional noise prediction
-            neg_noise_pred: Unconditional noise prediction
-            true_cfg_scale: CFG scale factor
-            cfg_normalize: Whether to normalize the combined prediction (default: False)
-
-        Returns:
-            Combined noise prediction tensor
+        Handles Wan2.2-specific logic: I2V blending, timestep expansion,
+        and model selection based on boundary_ratio.
         """
-        if is_pipeline_last_stage():
-            return neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+        attention_kwargs = extra_kwargs["attention_kwargs"]
+        prompt_embeds = extra_kwargs["prompt_embeds"]
+        negative_prompt_embeds = extra_kwargs["negative_prompt_embeds"]
+        original_dims = extra_kwargs["original_dims"]
+        boundary_timestep = extra_kwargs["boundary_timestep"]
+        latent_condition = extra_kwargs.get("latent_condition")
+        first_frame_mask = extra_kwargs.get("first_frame_mask")
+
+        # Select model based on timestep and boundary_ratio
+        if boundary_timestep is not None and timestep < boundary_timestep:
+            current_model = self.transformer_2 if self.transformer_2 is not None else self.transformer
         else:
-            return noise_pred, neg_noise_pred
+            current_model = self.transformer if self.transformer is not None else self.transformer_2
+
+        if self.expand_timesteps and latent_condition is not None:
+            if is_pipeline_first_stage():
+                # I2V mode: blend condition with latents using mask
+                latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
+
+            # Expand timesteps per patch - use floor division to match patch embedding
+            patch_size = self.transformer_config.patch_size
+            patch_height = latents.shape[3] // patch_size[1]
+            patch_width = latents.shape[4] // patch_size[2]
+
+            # Create mask at patch resolution (same as hidden states sequence length)
+            patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
+            patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
+            temp_ts = (patch_mask[0][0] * timestep).flatten()
+            timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+        else:
+            # T2V mode: standard forward
+            timestep = timestep.expand(original_dims[0])
+
+        positive_kwargs = {
+            "hidden_states": latents,
+            "timestep": timestep,
+            "encoder_hidden_states": prompt_embeds,
+            "attention_kwargs": attention_kwargs,
+            "return_dict": False,
+            "current_model": current_model,
+            "dims": original_dims,
+        }
+        negative_kwargs = None
+        if do_true_cfg:
+            negative_kwargs = {
+                "hidden_states": latents if is_pipeline_first_stage() else noise_uncond,
+                "timestep": timestep,
+                "encoder_hidden_states": negative_prompt_embeds,
+                "attention_kwargs": attention_kwargs,
+                "return_dict": False,
+                "current_model": current_model,
+                "dims": original_dims,
+            }
+
+        return positive_kwargs, negative_kwargs
 
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """
@@ -834,323 +882,3 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
 
         if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
-
-    def _init_sync_pipeline(self, latents: torch.Tensor):
-        get_runtime_state().set_patched_mode(patch_mode=False)
-        return latents
-
-    def _sync_pipeline(
-        self,
-        attention_kwargs,
-        boundary_timestep,
-        dtype,
-        first_frame_mask,
-        guidance_high,
-        guidance_low,
-        latent_condition,
-        latents,
-        negative_prompt_embeds,
-        prompt_embeds,
-        timesteps,
-        original_dims,
-        sync_only: bool = False,
-    ):
-        latents = self._init_sync_pipeline(latents)
-        noise_uncond = None
-
-        for i, t in enumerate(timesteps):
-            self._current_timestep = t
-
-            # Select model based on timestep and boundary_ratio
-            # High noise stage (t >= boundary_timestep): use transformer
-            # Low noise stage (t < boundary_timestep): use transformer_2
-            if boundary_timestep is not None and t < boundary_timestep:
-                # Low noise stage - always use guidance_high for this stage
-                current_guidance_scale = guidance_high
-                if self.transformer_2 is not None:
-                    current_model = self.transformer_2
-                elif self.transformer is not None:
-                    # Fallback to transformer if transformer_2 not loaded
-                    current_model = self.transformer
-                else:
-                    raise RuntimeError("No transformer available for low-noise stage")
-            else:
-                # High noise stage - always use guidance_low for this stage
-                current_guidance_scale = guidance_low
-                if self.transformer is not None:
-                    current_model = self.transformer
-                elif self.transformer_2 is not None:
-                    # Fallback to transformer_2 if transformer not loaded
-                    current_model = self.transformer_2
-                else:
-                    raise RuntimeError("No transformer available for high-noise stage")
-
-            do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-
-            if is_pipeline_last_stage():
-                # FIXME: why is `.to(dtype)` important
-                last_timestep_latents = latents.to(dtype)
-
-            # when there is only one pp stage, no need to recv
-            if get_pipeline_parallel_world_size() == 1:
-                pass
-            # all ranks should recv the latent from the previous rank except
-            #   the first rank in the first pipeline forward which should use
-            #   the input latent
-            elif is_pipeline_first_stage() and i == 0:
-                pass
-            else:
-                latents = get_pp_group().pipeline_recv()
-                if do_true_cfg and not is_pipeline_first_stage():
-                    noise_uncond = get_pp_group().pipeline_recv(name="noise_uncond")
-
-            if self.expand_timesteps and latent_condition is not None:
-                if is_pipeline_first_stage():
-                    # I2V mode: blend condition with latents using mask
-                    latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
-                    latent_model_input = latent_model_input.to(dtype)
-                else:
-                    latent_model_input = latents.to(dtype)
-
-                # Expand timesteps per patch - use floor division to match patch embedding
-                patch_size = self.transformer_config.patch_size
-                patch_height = latents.shape[3] // patch_size[1]
-                patch_width = latents.shape[4] // patch_size[2]
-
-                # Create mask at patch resolution (same as hidden states sequence length)
-                patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
-                patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
-                temp_ts = (patch_mask[0][0] * t).flatten()
-                timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-            else:
-                # T2V mode: standard forward
-                latent_model_input = latents.to(dtype)
-                timestep = t.expand(latents.shape[0])
-
-            # Prepare kwargs for positive and negative predictions
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep,
-                "encoder_hidden_states": prompt_embeds,
-                "attention_kwargs": attention_kwargs,
-                "return_dict": False,
-                "current_model": current_model,
-                "dims": original_dims,
-            }
-            negative_kwargs = None
-            if do_true_cfg:
-                negative_kwargs = {
-                    "hidden_states": latent_model_input if is_pipeline_first_stage() else noise_uncond,
-                    "timestep": timestep,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                    "dims": original_dims,
-                }
-
-            # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_true_cfg,
-                true_cfg_scale=current_guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=False,
-            )
-
-            if is_pipeline_last_stage():
-                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, last_timestep_latents, do_true_cfg)
-
-            if sync_only and is_pipeline_last_stage() and i == len(timesteps) - 1:
-                pass
-            elif get_pipeline_parallel_world_size() > 1:
-                if is_pipeline_last_stage():
-                    get_pp_group().pipeline_send(latents)
-                else:
-                    get_pp_group().pipeline_send(noise_pred[0])
-                    if do_true_cfg:
-                        get_pp_group().pipeline_send(noise_pred[1], name="noise_uncond")
-
-        return latents
-
-    def _init_async_pipeline(self, num_timesteps: int, latents: torch.Tensor):
-        get_runtime_state().set_patched_mode(patch_mode=True)
-
-        if is_pipeline_first_stage():
-            # get latents computed in warmup stage
-            # ignore latents after the last timestep
-            latents = get_pp_group().pipeline_recv() if get_runtime_state().warmup_steps > 0 else latents
-            patch_latents = list(latents.split(get_runtime_state().pp_patches_height, dim=-2))
-        elif is_pipeline_last_stage():
-            patch_latents = list(latents.split(get_runtime_state().pp_patches_height, dim=-2))
-            # Split scheduler caches into per-patch versions for async pipeline
-            self.scheduler.split_caches_for_patches(get_runtime_state().pp_patches_height, dim=-2)
-        else:
-            patch_latents = [None] * get_runtime_state().num_pipeline_patch
-
-        recv_timesteps = num_timesteps - 1 if is_pipeline_first_stage() else num_timesteps
-        for _ in range(recv_timesteps):
-            for patch_idx in range(get_runtime_state().num_pipeline_patch):
-                if not is_pipeline_first_stage():
-                    get_pp_group().add_pipeline_recv_task(patch_idx, name="noise_uncond")
-                get_pp_group().add_pipeline_recv_task(patch_idx)
-
-        return patch_latents
-
-    def _async_pipeline(
-        self,
-        attention_kwargs,
-        boundary_timestep,
-        dtype,
-        first_frame_mask,
-        guidance_high,
-        guidance_low,
-        latent_condition,
-        latents,
-        negative_prompt_embeds,
-        prompt_embeds,
-        timesteps,
-        original_dims,
-    ):
-        if len(timesteps) == 0:
-            return latents
-        num_pipeline_patch = get_runtime_state().num_pipeline_patch
-        patch_latents = self._init_async_pipeline(num_timesteps=len(timesteps), latents=latents)
-        last_patch_latents = [None] * num_pipeline_patch if is_pipeline_last_stage() else None
-        noise_uncond = None
-
-        first_async_recv = True
-        for i, t in enumerate(timesteps):
-            self._current_timestep = t
-
-            # Select model based on timestep and boundary_ratio
-            # High noise stage (t >= boundary_timestep): use transformer
-            # Low noise stage (t < boundary_timestep): use transformer_2
-            if boundary_timestep is not None and t < boundary_timestep:
-                # Low noise stage - always use guidance_high for this stage
-                current_guidance_scale = guidance_high
-                if self.transformer_2 is not None:
-                    current_model = self.transformer_2
-                elif self.transformer is not None:
-                    # Fallback to transformer if transformer_2 not loaded
-                    current_model = self.transformer
-                else:
-                    raise RuntimeError("No transformer available for low-noise stage")
-            else:
-                # High noise stage - always use guidance_low for this stage
-                current_guidance_scale = guidance_low
-                if self.transformer is not None:
-                    current_model = self.transformer
-                elif self.transformer_2 is not None:
-                    # Fallback to transformer_2 if transformer not loaded
-                    current_model = self.transformer_2
-                else:
-                    raise RuntimeError("No transformer available for high-noise stage")
-
-            do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-
-            for patch_idx in range(num_pipeline_patch):
-                if is_pipeline_last_stage():
-                    last_patch_latents[patch_idx] = patch_latents[patch_idx].to(dtype)
-
-                if is_pipeline_first_stage() and i == 0:
-                    pass
-                else:
-                    if first_async_recv:
-                        if do_true_cfg and not is_pipeline_first_stage():
-                            get_pp_group().recv_next()
-                        get_pp_group().recv_next()
-                        first_async_recv = False
-
-                    if do_true_cfg and not is_pipeline_first_stage():
-                        noise_uncond = get_pp_group().get_pipeline_recv_data(idx=patch_idx, name="noise_uncond")
-                    patch_latents[patch_idx] = get_pp_group().get_pipeline_recv_data(idx=patch_idx)
-
-                if self.expand_timesteps and latent_condition is not None:
-                    if is_pipeline_first_stage():
-                        # I2V mode: blend condition with latents using mask
-                        latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
-                        latent_model_input = latent_model_input.to(dtype)
-                    else:
-                        latent_model_input = latents.to(dtype)
-
-                    # Expand timesteps per patch - use floor division to match patch embedding
-                    patch_size = self.transformer_config.patch_size
-                    patch_height = latents.shape[3] // patch_size[1]
-                    patch_width = latents.shape[4] // patch_size[2]
-
-                    # Create mask at patch resolution (same as hidden states sequence length)
-                    patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
-                    patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
-                    temp_ts = (patch_mask[0][0] * t).flatten()
-                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                else:
-                    # T2V mode: standard forward
-                    latent_model_input = patch_latents[patch_idx].to(dtype)
-                    timestep = t.expand(latents.shape[0])
-
-                # Prepare kwargs for positive and negative predictions
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                    "dims": original_dims,
-                }
-                negative_kwargs = None
-                if do_true_cfg:
-                    negative_kwargs = {
-                        "hidden_states": latent_model_input if is_pipeline_first_stage() else noise_uncond,
-                        "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "attention_kwargs": attention_kwargs,
-                        "return_dict": False,
-                        "current_model": current_model,
-                        "dims": original_dims,
-                    }
-
-                # Predict noise with automatic CFG parallel handling
-                patch_latents[patch_idx] = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=current_guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
-
-                if is_pipeline_last_stage():
-                    # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                    patch_latents[patch_idx] = self.scheduler_step_maybe_with_cfg(
-                        patch_latents[patch_idx], t, last_patch_latents[patch_idx], do_true_cfg
-                    )
-                    if i != len(timesteps) - 1:
-                        get_pp_group().pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
-                else:
-                    if do_true_cfg:
-                        get_pp_group().pipeline_isend(
-                            patch_latents[patch_idx][1], name="noise_uncond", segment_idx=patch_idx
-                        )
-                    get_pp_group().pipeline_isend(patch_latents[patch_idx][0], segment_idx=patch_idx)
-
-                if is_pipeline_first_stage() and i == 0:
-                    pass
-                else:
-                    if i == len(timesteps) - 1 and patch_idx == num_pipeline_patch - 1:
-                        pass
-                    elif is_pipeline_first_stage():
-                        get_pp_group().recv_next()
-                    else:
-                        # recv noise_uncond
-                        get_pp_group().recv_next()
-                        # recv latents
-                        get_pp_group().recv_next()
-
-                get_runtime_state().next_patch()
-
-        latents = None
-        if is_pipeline_last_stage():
-            latents = torch.cat(patch_latents, dim=-2)
-        return latents
