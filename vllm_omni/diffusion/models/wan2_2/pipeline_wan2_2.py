@@ -629,12 +629,23 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
         # Decode
-        # FIXME: don't use distributed VAE for now
         output = None
-        if is_dp_last_group():
-            if output_type == "latent":
+        if output_type == "latent":
+            if is_dp_last_group():
                 output = latents
-            else:
+            output = self.pipefusion_send_output_to_first_rank(output)
+        else:
+            is_distributed_vae = hasattr(self.vae, "is_distributed_enabled") and self.vae.is_distributed_enabled()
+
+            latents = self.pipefusion_distribute_latents(
+                latents,
+                is_distributed_vae=is_distributed_vae,
+                vae_dtype=self.vae.dtype,
+                vae_device=self.vae.device,
+                original_dims=original_dims,
+            )
+
+            if is_distributed_vae or is_pipeline_first_stage():
                 latents = latents.to(self.vae.dtype)
                 latents_mean = (
                     torch.tensor(self.vae.config.latents_mean)
@@ -646,9 +657,6 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
                 ).to(latents.device, latents.dtype)
                 latents = latents / latents_std + latents_mean
                 output = self.vae.decode(latents, return_dict=False)[0]
-
-        # Send output from last rank to first rank for pipeline parallel
-        output = self.pipefusion_send_output_to_first_rank(output)
 
         return DiffusionOutput(output=output)
 

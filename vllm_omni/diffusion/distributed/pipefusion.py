@@ -19,8 +19,10 @@ from abc import ABCMeta
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_dit_group,
     get_pipeline_parallel_world_size,
     get_pp_group,
     is_pipeline_first_stage,
@@ -308,7 +310,8 @@ class PipeFusionPipelineMixin(metaclass=ABCMeta):
             latents = torch.cat(patch_latents, dim=-2)
         return latents
 
-    def pipefusion_send_output_to_first_rank(self, output: torch.Tensor | None) -> torch.Tensor | None:
+    @staticmethod
+    def pipefusion_send_output_to_first_rank(output: torch.Tensor | None) -> torch.Tensor | None:
         """Send final output from last rank to first rank for pipeline parallel."""
         if get_pipeline_parallel_world_size() > 1:
             if is_pipeline_last_stage():
@@ -317,3 +320,33 @@ class PipeFusionPipelineMixin(metaclass=ABCMeta):
                 output_dict = get_pp_group().recv_tensor_dict(src=get_pipeline_parallel_world_size() - 1)
                 output = output_dict["output"]
         return output
+
+    def pipefusion_distribute_latents(
+        self,
+        latents: torch.Tensor,
+        is_distributed_vae: bool,
+        vae_dtype: torch.dtype,
+        vae_device: torch.device,
+        original_dims: tuple[int, ...],
+    ) -> torch.Tensor:
+        """
+        Distribute latents to the appropriate rank(s) for VAE decoding.
+
+        If VAE parallel is enabled, broadcast latents from the last pipeline rank to all ranks in the
+        distributed VAE group.
+        If VAE parallel is disabled, send latents from the last pipeline rank to the first pipeline rank,
+        so that decoding can happen on the first rank.
+        """
+        if is_distributed_vae:
+            dit_group = get_dit_group()
+            dit_rank = dist.get_rank(dit_group)
+            src_rank = dist.get_world_size(dit_group) - 1
+
+            if dit_rank == src_rank:
+                latents = latents.to(vae_dtype)
+            else:
+                latents = torch.empty(original_dims, dtype=vae_dtype, device=vae_device)
+            dist.broadcast(latents, src=src_rank, group=dit_group)
+        else:
+            latents = self.pipefusion_send_output_to_first_rank(latents)
+        return latents
