@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from tests.utils import GPUMemoryMonitor
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -121,6 +122,14 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of pipeline parallel stages.",
     )
+    parser.add_argument(
+        "--pipefusion-warmup-steps",
+        type=int,
+        default=1,
+        help="Number of warmup steps for PipeFusion pipeline parallelism. "
+        "During warmup, all ranks process the full latent synchronously. "
+        "After warmup, ranks process patches asynchronously for better throughput.",
+    )
     return parser.parse_args()
 
 
@@ -155,6 +164,7 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
+        pipefusion_warmup_steps=args.pipefusion_warmup_steps,
     )
 
     # Check if profiling is requested via environment variable
@@ -188,11 +198,15 @@ def main():
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
-        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size}"
+        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size},"
+        f" pipefusion_warmup_steps={args.pipefusion_warmup_steps}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
+    current_omni_platform.empty_cache()
+    monitor = GPUMemoryMonitor(device_index=torch.cuda.current_device(), interval=0.02)
+    monitor.start()
     generation_start = time.perf_counter()
     frames = omni.generate(
         {
@@ -211,9 +225,14 @@ def main():
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
+    peak = monitor.peak_used_mb
+    monitor.stop()
 
     # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+    print(
+        f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)"
+        f" | Peak memory usage: {peak:.2f} MB"
+    )
 
     # Extract video frames from OmniRequestOutput
     if isinstance(frames, list) and len(frames) > 0:

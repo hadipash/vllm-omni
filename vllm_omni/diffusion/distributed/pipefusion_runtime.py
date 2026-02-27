@@ -86,11 +86,11 @@ class DiTRuntimeState:
         get_pp_group().set_config(dtype)
 
 
-def initialize_runtime_state(patch_size: tuple[int, int, int] = (1, 2, 2)):
+def initialize_runtime_state(patch_size: tuple[int, int, int] = (1, 2, 2), warmup_steps: int = 1):
     global _RUNTIME
     if _RUNTIME is not None:
         logger.warning("Runtime state is already initialized, reinitializing with pipeline...")
-    _RUNTIME = DiTRuntimeState(patch_size=patch_size)
+    _RUNTIME = DiTRuntimeState(patch_size=patch_size, warmup_steps=warmup_steps)
 
 
 def get_runtime_state():

@@ -315,7 +315,10 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
         self._num_timesteps = None
         self._current_timestep = None
 
-        initialize_runtime_state(patch_size=self.transformer_config.patch_size)
+        initialize_runtime_state(
+            patch_size=self.transformer_config.patch_size,
+            warmup_steps=od_config.parallel_config.pipefusion_warmup_steps,
+        )
 
     @property
     def guidance_scale(self):

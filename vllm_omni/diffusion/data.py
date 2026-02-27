@@ -67,6 +67,11 @@ class DiffusionParallelConfig:
     hsdp_replicate_size: int = 1
     """Number of replica groups for HSDP. Each replica holds a full sharded copy."""
 
+    pipefusion_warmup_steps: int = 1
+    """Number of warmup steps for PipeFusion pipeline parallelism.
+    During warmup, all ranks process the full latent synchronously.
+    After warmup, ranks process patches asynchronously for better throughput."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""

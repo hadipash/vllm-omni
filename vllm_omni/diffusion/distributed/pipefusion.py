@@ -15,7 +15,7 @@ Usage:
             ...
 """
 
-from abc import ABCMeta
+from abc import ABC, abstractmethod
 from typing import Any
 
 import torch
@@ -31,7 +31,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.pipefusion_runtime import get_runtime_state
 
 
-class PipeFusionPipelineMixin(metaclass=ABCMeta):
+class PipeFusionPipelineMixin(ABC):
     """
     Mixin class providing PipeFusion (patch-wise + pipeline parallel) logic
     for diffusion pipelines.
@@ -67,6 +67,7 @@ class PipeFusionPipelineMixin(metaclass=ABCMeta):
         else:
             return noise_pred, neg_noise_pred
 
+    @abstractmethod
     def prepare_pipefusion_noise_kwargs(
         self,
         latents: torch.Tensor,
@@ -285,10 +286,9 @@ class PipeFusionPipelineMixin(metaclass=ABCMeta):
                         get_pp_group().pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
                 else:
                     if do_true_cfg:
-                        get_pp_group().pipeline_isend(
-                            patch_latents[patch_idx][1], name="noise_uncond", segment_idx=patch_idx
-                        )
-                    get_pp_group().pipeline_isend(patch_latents[patch_idx][0], segment_idx=patch_idx)
+                        patch_latents[patch_idx], noise_uncond = patch_latents[patch_idx]
+                        get_pp_group().pipeline_isend(noise_uncond, name="noise_uncond", segment_idx=patch_idx)
+                    get_pp_group().pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
 
                 if is_pipeline_first_stage() and i == 0:
                     pass
