@@ -182,7 +182,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         raise NotImplementedError("Subclasses must implement diffuse")
 
-    def scheduler_step(self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
+    def scheduler_step(
+        self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor, **kwargs
+    ) -> torch.Tensor:
         """
         Step the scheduler.
 
@@ -190,14 +192,16 @@ class CFGParallelMixin(metaclass=ABCMeta):
             noise_pred: Predicted noise
             t: Current timestep
             latents: Current latents
+            **kwargs: Additional arguments forwarded to scheduler.step()
+                      (e.g., is_last_patch, is_first_patch).
 
         Returns:
             Updated latents after scheduler step
         """
-        return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        return self.scheduler.step(noise_pred, t, latents, return_dict=False, **kwargs)[0]
 
     def scheduler_step_maybe_with_cfg(
-        self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor, do_true_cfg: bool
+        self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor, do_true_cfg: bool, **kwargs
     ) -> torch.Tensor:
         """
         Step the scheduler with (maybe) automatic CFG parallel synchronization.
@@ -223,13 +227,13 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
             # Only rank 0 computes the scheduler step
             if cfg_rank == 0:
-                latents = self.scheduler_step(noise_pred, t, latents)
+                latents = self.scheduler_step(noise_pred, t, latents, **kwargs)
 
             # Broadcast the updated latents to all ranks
             latents = latents.contiguous()
             cfg_group.broadcast(latents, src=0)
         else:
             # No CFG parallel: directly compute scheduler step
-            latents = self.scheduler_step(noise_pred, t, latents)
+            latents = self.scheduler_step(noise_pred, t, latents, **kwargs)
 
         return latents

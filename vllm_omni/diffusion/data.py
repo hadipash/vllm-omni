@@ -77,6 +77,16 @@ class DiffusionParallelConfig:
     'height' splits the spatial height dimension (default).
     'temporal' splits the frames/temporal dimension."""
 
+    use_bubble_filling: bool = False
+    """Enable patch rotation and skip/correct to fill pipeline bubbles.
+    Automatically enabled when pipeline_parallel_size >= 2."""
+
+    use_taylorseer: bool = False
+    """Use TaylorSeer extrapolation instead of DirectReuse for correction."""
+
+    taylorseer_max_order: int = 1
+    """Maximum polynomial order for TaylorSeer correction."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
@@ -98,6 +108,10 @@ class DiffusionParallelConfig:
         if self.use_hsdp:
             assert self.hsdp_replicate_size > 0, "HSDP replicate size must be > 0"
             assert self.hsdp_shard_size > 0, "HSDP shard size must be > 0 (should be set in __post_init__)"
+        if self.use_taylorseer and not self.use_bubble_filling:
+            raise ValueError("use_taylorseer requires use_bubble_filling to be enabled")
+        if self.taylorseer_max_order < 1:
+            raise ValueError(f"taylorseer_max_order must be >= 1, got {self.taylorseer_max_order}")
         return self
 
     def __post_init__(self) -> None:

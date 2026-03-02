@@ -140,6 +140,23 @@ def parse_args() -> argparse.Namespace:
         "'temporal' splits the frames/temporal dimension.",
     )
     parser.add_argument(
+        "--use-bubble-filling",
+        action="store_true",
+        help="Enable patch rotation + skip/correct to fill pipeline bubbles. "
+        "Automatically enabled when pipeline-parallel-size >= 2.",
+    )
+    parser.add_argument(
+        "--use-taylorseer",
+        action="store_true",
+        help="Use TaylorSeer extrapolation instead of DirectReuse for bubble correction.",
+    )
+    parser.add_argument(
+        "--taylorseer-max-order",
+        type=int,
+        default=1,
+        help="Maximum polynomial order for TaylorSeer correction (default: 1).",
+    )
+    parser.add_argument(
         "--bench",
         action="store_true",
         help="Benchmark pipeline by running execution 5 times.",
@@ -185,6 +202,9 @@ def main():
         pipeline_parallel_size=args.pipeline_parallel_size,
         pipefusion_warmup_steps=args.pipefusion_warmup_steps,
         pipefusion_split_dim=args.pipefusion_split_dim,
+        use_bubble_filling=args.use_bubble_filling,
+        use_taylorseer=args.use_taylorseer,
+        taylorseer_max_order=args.taylorseer_max_order,
     )
 
     # Check if profiling is requested via environment variable

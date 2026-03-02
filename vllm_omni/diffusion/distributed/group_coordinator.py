@@ -4,7 +4,7 @@
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from typing import Any
 
 import torch
@@ -16,7 +16,6 @@ from vllm_omni.diffusion import envs
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
-
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -618,7 +617,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         self.recv_buffer_set: bool = False
         self.recv_tasks_queue: list[tuple[str, int]] = []
-        self.receiving_tasks: list[tuple[torch.distributed.Work, str, int]] = []
+        self.receiving_tasks: defaultdict[str, dict[int, torch.distributed.Work]] = defaultdict(dict)
         self.dtype: torch.dtype | None = None
         self.num_pipefusion_patches: int | None = None
 
@@ -639,7 +638,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
     def reset_buffer(self):
         self.recv_tasks_queue = []
-        self.receiving_tasks = []
+        self.receiving_tasks = defaultdict(dict)
         self.recv_shape = {}
         self.send_shape = {}
         self.recv_buffer = {}
@@ -805,44 +804,49 @@ class PipelineGroupCoordinator(GroupCoordinator):
     def pipeline_send(self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1) -> None:
         tensor = tensor.contiguous()
         self._check_shape_and_buffer(tensor_send_to_next=tensor, name=name, segment_idx=segment_idx)
-        # logger.info(f"Step {None} Rank {self.rank}: Sending {name} segment {segment_idx} to rank {self.next_rank}")
         self._pipeline_isend(tensor).wait()
-        # logger.info(f"Step {None} Rank {self.rank}: Sent {name} segment {segment_idx} to rank {self.next_rank}")
 
     def pipeline_isend(self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1) -> None:
         tensor = tensor.contiguous()
         self._check_shape_and_buffer(tensor_send_to_next=tensor, name=name, segment_idx=segment_idx)
-        # logger.info(f"Step {None} Rank {self.rank}: Sending {name} segment {segment_idx} to rank {self.next_rank}")
         self._pipeline_isend(tensor)
-        # logger.info(f"Step {None} Rank {self.rank}: Sent {name} segment {segment_idx} to rank {self.next_rank}")
+        # logger.info(f"Step {step} Rank {self.rank}: Sent {name} segment {segment_idx} to rank {self.next_rank}")
 
     def pipeline_recv(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
         name = name or "latent"
         self._check_shape_and_buffer(recv_prev=True, name=name, segment_idx=idx)
-        # logger.info(f"Step {None} Rank {self.rank}: Post receive {name} segment {idx} to rank {self.prev_rank}")
         self._pipeline_irecv(self.recv_buffer[name][idx]).wait()
-        # logger.info(f"Step {None} Rank {self.rank}: Received {name} segment {idx} from rank {self.prev_rank}")
         return self.recv_buffer[name][idx]
 
     def add_pipeline_recv_task(self, idx: int = -1, name: str = "latent"):
         name = name or "latent"
         self.recv_tasks_queue.append((name, idx))
 
+    def add_pipeline_recv_tasks(self, idx_list: list[int], names: list[str] | None = None):
+        if names is None:
+            names = ["latent"] * len(idx_list)
+        self.recv_tasks_queue.extend([(name or "latent", i) for i, name in zip(idx_list, names)])
+
     def recv_next(self):
         if len(self.recv_tasks_queue) == 0:
             raise ValueError("No more tasks to receive")
         elif len(self.recv_tasks_queue) > 0:
             name, idx = self.recv_tasks_queue.pop(0)
+            if name in self.receiving_tasks and idx in self.receiving_tasks[name]:
+                logger.info("Patch idx overlap, deferring reception until the next step.")
+                self.recv_tasks_queue.insert(0, (name, idx))
+                return
+            # logger.info(f"Step {step} Rank {self.rank}: Post receive {name} segment {idx} to rank {self.prev_rank}")
             self._check_shape_and_buffer(recv_prev=True, name=name, segment_idx=idx)
-            # logger.info(f"Step {None} Rank {self.rank}: Post receive {name} segment {idx} to rank {self.prev_rank}")
-            self.receiving_tasks.append((self._pipeline_irecv(self.recv_buffer[name][idx]), name, idx))
+            self.receiving_tasks[name][idx] = self._pipeline_irecv(self.recv_buffer[name][idx])
 
     def get_pipeline_recv_data(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
-        assert len(self.receiving_tasks) > 0, "No tasks to receive, call add_pipeline_recv_task first"
-        receiving_task = self.receiving_tasks.pop(0)
-        receiving_task[0].wait()
-        # logger.info(f"Step {None} Rank {self.rank}: Received {name} segment {idx} from rank {self.prev_rank}")
-        assert receiving_task[1] == name and receiving_task[2] == idx, "Received tensor does not match the requested"
+        assert name in self.receiving_tasks and idx in self.receiving_tasks[name], (
+            f"No pending recv for ({name}, {idx}), call add_pipeline_recv_task + recv_next first"
+        )
+        receiving_task = self.receiving_tasks[name].pop(idx)
+        receiving_task.wait()
+        # logger.info(f"Step {step} Rank {self.rank}: Received {name} segment {idx} from rank {self.prev_rank}")
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):

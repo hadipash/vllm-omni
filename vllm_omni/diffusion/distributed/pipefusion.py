@@ -18,18 +18,23 @@ Usage:
 from abc import ABC, abstractmethod
 from typing import Any
 
+import numpy as np
 import torch
 import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_dit_group,
+    get_pipeline_parallel_rank,
     get_pipeline_parallel_world_size,
     get_pp_group,
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
 from vllm_omni.diffusion.distributed.pipefusion_runtime import get_runtime_state
+
+logger = init_logger(__name__)
 
 
 class PipeFusionPipelineMixin(ABC):
@@ -236,7 +241,20 @@ class PipeFusionPipelineMixin(ABC):
         """
         if len(timesteps) == 0:
             return latents
-        num_pipeline_patch = get_runtime_state().num_pipeline_patch
+
+        runtime = get_runtime_state()
+        if runtime.use_bubble_filling:
+            return self._pipefusion_async_pipeline_bubble_filling(
+                timesteps=timesteps,
+                latents=latents,
+                dtype=dtype,
+                do_true_cfg_fn=do_true_cfg_fn,
+                guidance_scale_fn=guidance_scale_fn,
+                profiler=profiler,
+                **extra_kwargs,
+            )
+
+        num_pipeline_patch = runtime.num_pipeline_patch
         num_pipeline_warmup_steps = get_runtime_state().warmup_steps
         with nvtx.range("async_init"):
             patch_latents = self._init_async_pipeline(num_timesteps=len(timesteps), latents=latents)
@@ -325,6 +343,178 @@ class PipeFusionPipelineMixin(ABC):
         latents = None
         if is_pipeline_last_stage():
             latents = torch.cat(patch_latents, dim=get_runtime_state().latent_split_dim)
+        return latents
+
+    def _init_async_pipeline_bubble_filling(
+        self, num_timesteps: int, latents: torch.Tensor
+    ) -> list[torch.Tensor | None]:
+        runtime = get_runtime_state()
+        runtime.set_patched_mode(patch_mode=True)
+
+        split_sizes = runtime.pp_patches_height
+        split_dim = runtime.latent_split_dim
+
+        if is_pipeline_first_stage():
+            latents = get_pp_group().pipeline_recv() if runtime.warmup_steps > 0 else latents
+            patch_latents = list(latents.split(split_sizes, dim=split_dim))
+        elif is_pipeline_last_stage():
+            patch_latents = list(latents.split(split_sizes, dim=split_dim))
+            self.scheduler.split_caches_for_patches(split_sizes, dim=split_dim)
+        else:
+            # Middle stages: split 3D token sequence using the correct method
+            # that handles non-contiguous height splits properly.
+            patch_latents = runtime.split_sequence(latents, dim=-2)
+        return patch_latents
+
+    def _pipefusion_async_pipeline_bubble_filling(
+        self,
+        timesteps: torch.Tensor,
+        latents: torch.Tensor,
+        dtype: torch.dtype,
+        do_true_cfg_fn: Any,
+        guidance_scale_fn: Any,
+        profiler: Any = None,
+        **extra_kwargs: Any,
+    ) -> torch.Tensor | None:
+        """
+        Async pipeline with patch rotation + skip/correct to fill bubbles.
+
+        Faithfully mirrors xDiT's ``_async_pipeline`` from the ``bubble_idea``
+        branch. Key design:
+
+        - **Correction inside transformer**: The transformer's ``forward()``
+          accepts ``skip`` / ``correct`` kwargs. During sync warmup it populates
+          the correction cache; ``_init_async_pipeline_bubble_filling`` triggers
+          ``set_patched_mode(True)`` which auto-splits the cache.
+        - **Patch rotation from i=0**: Each stage starts at a different offset
+          so all stages compute simultaneously.
+        - **FIFO recv queue**: recv tasks are queued per-timestep in the
+          **sender's** send order so NCCL FIFO matching is correct.
+          ``recv_next()`` is called progressively at the end of each patch
+          (not all at once). ``get_pipeline_recv_data()`` retrieves by
+          ``(name, idx)`` dict lookup.
+        - **Skip**: last patch in rotated order on non-last stages — don't
+          compute, don't send.
+        - **Correct**: first patch in rotated order on non-first stages — use
+          forecasted input from correction cache.
+        """
+        runtime = get_runtime_state()
+        num_pipeline_patch = runtime.num_pipeline_patch
+        pp_group = get_pp_group()
+
+        num_pipeline_warmup_steps = get_runtime_state().warmup_steps
+        with nvtx.range("async_init"):
+            patch_latents = self._init_async_pipeline_bubble_filling(num_timesteps=len(timesteps), latents=latents)
+        last_patch_latents = [None] * num_pipeline_patch if is_pipeline_last_stage() else None
+
+        # Each device have a different order to process the patches
+        patch_indices = np.roll(range(num_pipeline_patch), get_pipeline_parallel_rank()).tolist()
+
+        noise_uncond = None
+
+        for i, t in enumerate(timesteps):
+            self._current_timestep = t
+
+            do_true_cfg = do_true_cfg_fn(t)
+            current_guidance_scale = guidance_scale_fn(t)
+
+            # logger.info(f"Step {i} Pipeline rank {get_pipeline_parallel_rank()}: {patch_indices}")
+            # add communication queue
+            if is_pipeline_first_stage() and i != len(timesteps) - 1:
+                # last stage sends and first stage receives patches in a different order
+                last_patch_indices = np.roll(
+                    np.roll(range(num_pipeline_patch), get_pipeline_parallel_world_size() - 1), i
+                )
+                pp_group.add_pipeline_recv_tasks(last_patch_indices.tolist())
+            # later stages use cached first patch from previous timestep
+            elif not is_pipeline_first_stage():
+                for patch_idx in patch_indices[1:]:  # First patch uses correction — no recv
+                    if do_true_cfg:
+                        pp_group.add_pipeline_recv_task(idx=patch_idx, name="noise_uncond")
+                    pp_group.add_pipeline_recv_task(idx=patch_idx)
+            # logger.info(f"Step {i} Pipeline rank {get_pipeline_parallel_rank()}: {get_pp_group().recv_tasks_queue}")
+
+            # --- Process patches in rotated order ---
+            for ip, patch_idx in enumerate(patch_indices):
+                runtime.next_patch(patch_idx=patch_idx)
+
+                is_last = ip == num_pipeline_patch - 1
+                should_skip = not is_pipeline_last_stage() and is_last
+                should_correct = not is_pipeline_first_stage() and ip == 0
+
+                if is_pipeline_last_stage():
+                    last_patch_latents[patch_idx] = patch_latents[patch_idx]
+
+                # always re-use the initial patch from previous timestep / warmup step (except the first stage)
+                with nvtx.range(f"async_recv_get{i + num_pipeline_warmup_steps}"):
+                    if not is_pipeline_first_stage() and ip > 0:
+                        if do_true_cfg:
+                            noise_uncond = pp_group.get_pipeline_recv_data(idx=patch_idx, name="noise_uncond")
+                        patch_latents[patch_idx] = pp_group.get_pipeline_recv_data(idx=patch_idx)
+                    elif is_pipeline_first_stage() and i != 0:
+                        patch_latents[patch_idx] = pp_group.get_pipeline_recv_data(idx=patch_idx)
+
+                # COMPUTE (with skip/correct flags passed to the transformer)
+                with nvtx.range(f"async_computation_{i + num_pipeline_warmup_steps}"):
+                    positive_kwargs, negative_kwargs = self.prepare_pipefusion_noise_kwargs(
+                        latents=patch_latents[patch_idx].to(dtype),
+                        timestep=t,
+                        do_true_cfg=do_true_cfg,
+                        noise_uncond=noise_uncond,
+                        skip=should_skip,
+                        correct=should_correct,
+                        **extra_kwargs,
+                    )
+
+                    patch_latents[patch_idx] = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=current_guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
+
+                if is_pipeline_last_stage():
+                    # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+                    with nvtx.range(f"async_computation_scheduler_{i + num_pipeline_warmup_steps}"):
+                        patch_latents[patch_idx] = self.scheduler_step_maybe_with_cfg(
+                            patch_latents[patch_idx],
+                            t,
+                            last_patch_latents[patch_idx],
+                            do_true_cfg,
+                            is_last_patch=is_last,
+                            is_first_patch=(ip == 0),
+                        )
+                    if i != len(timesteps) - 1:
+                        with nvtx.range(f"async_send_{i + num_pipeline_warmup_steps}"):
+                            pp_group.pipeline_isend(patch_latents[patch_idx].to(dtype), segment_idx=patch_idx)
+                else:
+                    if do_true_cfg:
+                        patch_latents[patch_idx], noise_uncond = patch_latents[patch_idx]
+                    # Non-last stages: don't send the last patch (it's skipped)
+                    if ip != num_pipeline_patch - 1:
+                        with nvtx.range(f"async_send_{i + num_pipeline_warmup_steps}"):
+                            if do_true_cfg:
+                                pp_group.pipeline_isend(noise_uncond, name="noise_uncond", segment_idx=patch_idx)
+                            pp_group.pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
+
+                # Post irecvs progressively (at end of each patch)
+                if len(pp_group.recv_tasks_queue):
+                    with nvtx.range(f"async_recv_next{i + num_pipeline_warmup_steps}"):
+                        if do_true_cfg and not is_pipeline_first_stage():
+                            pp_group.recv_next()
+                        pp_group.recv_next()
+
+            # roll the patch indices for next timestep
+            patch_indices = np.roll(patch_indices, 1 - num_pipeline_patch).tolist()
+
+            # Step profiler after each timestep if profiling is enabled
+            if profiler is not None:
+                profiler.step()
+
+        latents = None
+        if is_pipeline_last_stage():
+            latents = torch.cat(patch_latents, dim=runtime.latent_split_dim)
         return latents
 
     @staticmethod

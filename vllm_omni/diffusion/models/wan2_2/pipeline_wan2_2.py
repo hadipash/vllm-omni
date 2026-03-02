@@ -318,10 +318,25 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
         self._num_timesteps = None
         self._current_timestep = None
 
+        # Create and attach correction objects to transformers when bubble filling is enabled
+        if od_config.parallel_config.use_bubble_filling:
+            from vllm_omni.diffusion.distributed.correction import DirectReuse, TaylorSeer
+
+            def _make_correction():
+                if od_config.parallel_config.use_taylorseer:
+                    return TaylorSeer(max_order=od_config.parallel_config.taylorseer_max_order)
+                return DirectReuse()
+
+            if self.transformer is not None:
+                self.transformer.correction = _make_correction()
+            if self.transformer_2 is not None:
+                self.transformer_2.correction = _make_correction()
+
         initialize_runtime_state(
             patch_size=self.transformer_config.patch_size,
             warmup_steps=od_config.parallel_config.pipefusion_warmup_steps,
             split_dim=od_config.parallel_config.pipefusion_split_dim,
+            use_bubble_filling=od_config.parallel_config.use_bubble_filling,
         )
 
     @property
@@ -622,7 +637,7 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
                     repeat=1,
                 ),
                 on_trace_ready=tensorboard_trace_handler(
-                    f"./logs/pipefusion/pp{get_pipeline_parallel_world_size()}/{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
+                    f"./logs/pipefusion_sched/pp{get_pipeline_parallel_world_size()}/{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
                 ),
             )
         else:
@@ -732,6 +747,8 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
         boundary_timestep = extra_kwargs["boundary_timestep"]
         latent_condition = extra_kwargs.get("latent_condition")
         first_frame_mask = extra_kwargs.get("first_frame_mask")
+        skip = extra_kwargs.get("skip", False)
+        correct = extra_kwargs.get("correct", False)
 
         # Select model based on timestep and boundary_ratio
         if boundary_timestep is not None and timestep < boundary_timestep:
@@ -767,6 +784,8 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
             "return_dict": False,
             "current_model": current_model,
             "dims": original_dims,
+            "skip": skip,
+            "correct": correct,
             "cond": "inputs",
         }
         negative_kwargs = None
@@ -779,6 +798,8 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
                 "return_dict": False,
                 "current_model": current_model,
                 "dims": original_dims,
+                "skip": skip,
+                "correct": correct,
                 "cond": "inputs_uncond",
             }
 

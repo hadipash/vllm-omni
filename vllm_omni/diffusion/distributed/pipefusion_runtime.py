@@ -25,12 +25,14 @@ class DiTRuntimeState:
         patch_size: tuple[int, int, int] = (1, 2, 2),
         warmup_steps: int = 1,
         split_dim: Literal["height", "temporal"] = "height",
+        use_bubble_filling: bool = False,
     ):
         self.patch_size = patch_size
         self.patch_mode = False
         self.pipeline_patch_idx = 0
         self.warmup_steps = warmup_steps
         self.split_dim = split_dim  # "height" or "temporal"
+        self.use_bubble_filling = use_bubble_filling
 
     def set_input_parameters(self, latents: torch.Tensor, dtype):
         self._calc_patches_metadata(latents)
@@ -40,8 +42,10 @@ class DiTRuntimeState:
         self.patch_mode = patch_mode
         self.pipeline_patch_idx = 0
 
-    def next_patch(self):
-        if self.patch_mode:
+    def next_patch(self, patch_idx: int | None = None):
+        if patch_idx is not None:
+            self.pipeline_patch_idx = patch_idx
+        elif self.patch_mode:
             self.pipeline_patch_idx += 1
             if self.pipeline_patch_idx == self.num_pipeline_patch:
                 self.pipeline_patch_idx = 0
@@ -49,9 +53,8 @@ class DiTRuntimeState:
             self.pipeline_patch_idx = 0
 
     def _calc_patch_metadata(self, seq_length):
-        lengths = [seq_length // self.num_pipeline_patch] * (self.num_pipeline_patch - 1)
-        # Give more tokens to the last patch, if it's the case.
-        lengths.append(seq_length // self.num_pipeline_patch + seq_length % self.num_pipeline_patch)
+        base_len, remainder = seq_length // self.num_pipeline_patch, seq_length % self.num_pipeline_patch
+        lengths = [base_len + int(i < remainder) for i in range(self.num_pipeline_patch)]
         start = 0
         start_end_idx = []
         for num in lengths:
@@ -120,6 +123,44 @@ class DiTRuntimeState:
             self.pp_patches_token_start_end_idx.append((start, start + num))
             start += num
 
+    def split_sequence(self, tensor: torch.Tensor, dim: int = -2) -> list[torch.Tensor]:
+        """Split a token-sequence tensor into per-patch chunks along the correct dimension.
+
+        For temporal splitting, tokens are contiguous in [f, h, w] order so a
+        simple ``tensor.split(token_nums, dim)`` works.
+
+        For height splitting, each patch's tokens are interleaved across frames
+        and NOT contiguous. We reshape to [B, ppf, pph, ppw, ...], slice along
+        the height axis, then flatten back.
+
+        Args:
+            tensor: Token-space tensor, e.g. [B, seq, D] with seq = ppf*pph*ppw.
+            dim: The sequence dimension in *tensor* (default -2).
+        """
+        if self.split_dim == "temporal":
+            return list(tensor.split(self.pp_patches_token_num, dim=dim))
+
+        # Height split — need 5D view
+        # tensor shape: [B, ppf*pph*ppw, *rest]
+        rest = tensor.shape[dim + 1 :] if dim != -1 else ()  # dims after seq
+        if dim < 0:
+            dim = tensor.ndim + dim
+
+        # Reshape seq → (ppf, pph, ppw)
+        new_shape = list(tensor.shape[:dim]) + [self.ppf, self.pph, self.ppw] + list(rest)
+        tensor_5d = tensor.view(new_shape)
+
+        # Split along pph (which is at position dim+1 in the reshaped tensor)
+        height_dim = dim + 1
+        splits = tensor_5d.split(self.pp_patches_post_height, dim=height_dim)
+
+        # Flatten (ppf, pph_patch, ppw) back to seq for each split
+        result = []
+        for s in splits:
+            flat_shape = list(s.shape[:dim]) + [-1] + list(rest)
+            result.append(s.reshape(flat_shape))
+        return result
+
     def _reset_recv_buffer(self, dtype):
         get_pp_group().reset_buffer()
         get_pp_group().set_config(dtype)
@@ -129,11 +170,17 @@ def initialize_runtime_state(
     patch_size: tuple[int, int, int] = (1, 2, 2),
     warmup_steps: int = 1,
     split_dim: Literal["height", "temporal"] = "height",
+    use_bubble_filling: bool = False,
 ):
     global _RUNTIME
     if _RUNTIME is not None:
         logger.warning("Runtime state is already initialized, reinitializing with pipeline...")
-    _RUNTIME = DiTRuntimeState(patch_size=patch_size, warmup_steps=warmup_steps, split_dim=split_dim)
+    _RUNTIME = DiTRuntimeState(
+        patch_size=patch_size,
+        warmup_steps=warmup_steps,
+        split_dim=split_dim,
+        use_bubble_filling=use_bubble_filling,
+    )
 
 
 def get_runtime_state():

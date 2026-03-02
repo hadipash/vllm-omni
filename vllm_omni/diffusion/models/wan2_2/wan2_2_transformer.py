@@ -866,6 +866,8 @@ class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
         self.timestep_proj_prepare = TimestepProjPrepare()
         self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
 
+        # Bubble filling correction (set by pipeline when enabled)
+        self.correction = None
         # PipeFusion: key that selects which KV cache set to use (cond vs uncond).
         # Set by predict_noise() before each forward pass.
         self.cache_key = "inputs"
@@ -884,6 +886,8 @@ class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         dims: tuple[int, int, int, int, int] = None,
+        skip: bool = False,
+        correct: bool = False,
     ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size, _, num_frames, height, width = dims
         p_t, p_h, p_w = self.config.patch_size
@@ -902,56 +906,72 @@ class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
             hidden_states = self.patch_embedding(hidden_states, dims)
             hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        # Handle timestep shape
-        if timestep.ndim == 2:
-            ts_seq_len = timestep.shape[1]
-            timestep = timestep.flatten()
+        # Bubble filling: skip/correct at the input to transformer blocks.
+        # This mirrors xDiT's approach where the correction lives inside the
+        # transformer. During sync warmup, update() seeds the cache; when
+        # entering patch mode the cache auto-splits into per-patch chunks.
+        if skip:
+            # Cache the input for future correction, skip all computation
+            if self.correction is not None:
+                self.correction.update(self.cache_key, hidden_states)
         else:
-            ts_seq_len = None
+            if correct and self.correction is not None:
+                hidden_states = self.correction.forecast(self.cache_key)
+            elif self.correction is not None:
+                self.correction.update(self.cache_key, hidden_states)
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
-        )
-        # Prepare timestep_proj via TimestepProjPrepare module
-        # _sp_plan will shard timestep_proj via split_output=True (when ts_seq_len is not None)
-        # This ensures timestep_proj sequence dimension matches sharded hidden_states
-        timestep_proj = self.timestep_proj_prepare(timestep_proj, ts_seq_len)
+            # Handle timestep shape
+            if timestep.ndim == 2:
+                ts_seq_len = timestep.shape[1]
+                timestep = timestep.flatten()
+            else:
+                ts_seq_len = None
 
-        if encoder_hidden_states_image is not None:
-            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+            temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+                timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
+            )
+            # Prepare timestep_proj via TimestepProjPrepare module
+            # _sp_plan will shard timestep_proj via split_output=True (when ts_seq_len is not None)
+            # This ensures timestep_proj sequence dimension matches sharded hidden_states
+            timestep_proj = self.timestep_proj_prepare(timestep_proj, ts_seq_len)
 
-        # Check for SP auto_pad: create attention mask dynamically if padding was applied
-        hidden_states_mask = None  # default
-        config = get_forward_context().omni_diffusion_config
-        parallel_config = config.parallel_config
-        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
-            ctx = get_forward_context()
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                # Create mask for the full (padded) sequence
-                # valid positions = True, padding positions = False
-                batch_size = hidden_states.shape[0]
-                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                hidden_states_mask = torch.ones(
-                    batch_size,
-                    padded_seq_len,
-                    dtype=torch.bool,
-                    device=hidden_states.device,
+            if encoder_hidden_states_image is not None:
+                encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+
+            # Check for SP auto_pad: create attention mask dynamically if padding was applied
+            hidden_states_mask = None  # default
+            config = get_forward_context().omni_diffusion_config
+            parallel_config = config.parallel_config
+            if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
+                ctx = get_forward_context()
+                if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                    # Create mask for the full (padded) sequence
+                    # valid positions = True, padding positions = False
+                    batch_size = hidden_states.shape[0]
+                    padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                    hidden_states_mask = torch.ones(
+                        batch_size,
+                        padded_seq_len,
+                        dtype=torch.bool,
+                        device=hidden_states.device,
+                    )
+                    hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+
+            # if mask is all true, set it to None
+            if hidden_states_mask is not None and hidden_states_mask.all():
+                hidden_states_mask = None
+
+            # Propagate cache_key to all self-attention modules so they
+            # use the correct KV cache (conditional vs unconditional).
+            for block in self.blocks:
+                # FIXME: do better
+                block.attn1._parent_cache_key = self.cache_key
+
+            # Transformer blocks
+            for block in self.blocks:
+                hidden_states = block(
+                    hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask
                 )
-                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-
-        # if mask is all true, set it to None
-        if hidden_states_mask is not None and hidden_states_mask.all():
-            hidden_states_mask = None
-
-        # Propagate cache_key to all self-attention modules so they
-        # use the correct KV cache (conditional vs unconditional).
-        for block in self.blocks:
-            # FIXME: do better
-            block.attn1._parent_cache_key = self.cache_key
-
-        # Transformer blocks
-        for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
 
         if self.pipefusion_should_output_project():
             # Output norm, projection & unpatchify

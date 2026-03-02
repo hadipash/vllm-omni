@@ -136,11 +136,18 @@ class PipeFusionTransformerMixin:
         stale data from a previous run (e.g. the dummy warmup run) from
         contaminating the current run.
         """
+        from vllm_omni.diffusion.distributed.correction import DirectReuse
+
         for module in self.modules():
             if isinstance(module, PipeFusionSelfAttentionMixin):
                 module._kv_caches = {}
             if isinstance(module, PipeFusionConv3dMixin):
                 module.activation_cache = None
+        # Reset correction cache (bubble filling) if attached
+        correction = getattr(self, "correction", None)
+        if isinstance(correction, DirectReuse):
+            correction.cache.clear()
+            correction.patch_mode = False
 
     # Class-level attribute: name of the block container to split for PP.
     # Subclasses can override this if their blocks attribute is named differently.

@@ -622,6 +622,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, PipeFusionSchedul
         sample: torch.Tensor,
         return_dict: bool = True,
         generator: torch.Generator | None = None,
+        **kwargs,
     ) -> SchedulerOutput | tuple:
         """
         Predict the sample from the previous timestep by reversing the SDE using multistep UniPC.
@@ -631,6 +632,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, PipeFusionSchedul
             timestep (`int`): Current discrete timestep in the diffusion chain.
             sample (`torch.Tensor`): Current sample created by the diffusion process.
             return_dict (`bool`): Whether to return a SchedulerOutput or tuple.
+            **kwargs: Additional arguments forwarded from the pipeline, including
+                      is_last_patch and is_first_patch for bubble filling.
 
         Returns:
             `SchedulerOutput` or `tuple`: The sample tensor at the previous timestep.
@@ -644,7 +647,9 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, PipeFusionSchedul
             self._init_step_index(timestep)
 
         # PipeFusion: get patch context and swap to current patch's caches
-        patch_idx, is_last_patch = self.pipefusion_step_begin()
+        patch_idx, is_first_patch, is_last_patch = self.pipefusion_step_begin(
+            kwargs.get("is_first_patch", None), kwargs.get("is_last_patch", None)
+        )
 
         use_corrector = (
             self.step_index > 0 and self.step_index - 1 not in self.disable_corrector and self.last_sample is not None
@@ -664,11 +669,11 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, PipeFusionSchedul
         for i in range(self.config.solver_order - 1):
             self.model_outputs[i] = self.model_outputs[i + 1]
             # Only shift timestep_list on first patch (it's shared, not per-patch)
-            if patch_idx == 0:
+            if is_first_patch:
                 self.timestep_list[i] = self.timestep_list[i + 1]
 
         self.model_outputs[-1] = model_output_convert
-        if patch_idx == 0:
+        if is_first_patch:
             self.timestep_list[-1] = timestep
 
         # Determine order for this step

@@ -117,29 +117,43 @@ class PipeFusionSchedulerMixin:
         """Clear per-patch caches when exiting async pipeline mode."""
         self._pf_patch_caches = None
 
-    def pipefusion_step_begin(self) -> tuple[int, bool]:
+    def pipefusion_step_begin(
+        self, is_first_patch: bool | None = None, is_last_patch: bool | None = None
+    ) -> tuple[int, bool, bool]:
         """
         Begin a scheduler step: get patch context and load per-patch state.
 
         Combines patch context lookup and state loading into a single call.
         In patch mode, swaps cached attributes to the current patch's versions.
 
+        Args:
+            is_first_patch: If provided, use this instead of the automatic
+                            patch_idx == 0 check. Needed with patch rotation.
+            is_last_patch: If provided, use this instead of the automatic
+                           patch_idx == N-1 check. Needed with patch rotation where the last
+                           patch in the rotated order is not necessarily patch_idx == N-1.
+
         Returns:
-            (patch_idx, is_last_patch) tuple:
+            (patch_idx, is_first_patch, is_last_patch) tuple:
             - patch_idx: Current patch index (0 if not in patch mode).
+            - is_first_patch: Whether this is the first patch in the sequence.
             - is_last_patch: Whether this is the last patch in the sequence.
         """
         runtime_state = get_runtime_state()
         patch_mode = runtime_state.patch_mode
         patch_idx = runtime_state.pipeline_patch_idx if patch_mode else 0
-        is_last_patch = not patch_mode or patch_idx == runtime_state.num_pipeline_patch - 1
+
+        if is_first_patch is None:
+            is_first_patch = not patch_mode or patch_idx == 0
+        if is_last_patch is None:
+            is_last_patch = not patch_mode or patch_idx == runtime_state.num_pipeline_patch - 1
 
         if patch_mode and self._pf_patch_caches is not None:
             for attr_name, _ in self._pipefusion_patch_cache_spec:
                 if attr_name in self._pf_patch_caches:
                     setattr(self, attr_name, self._pf_patch_caches[attr_name][patch_idx])
 
-        return patch_idx, is_last_patch
+        return patch_idx, is_first_patch, is_last_patch
 
     def pipefusion_update_value(self, attr_name: str, value: Any) -> None:
         """
