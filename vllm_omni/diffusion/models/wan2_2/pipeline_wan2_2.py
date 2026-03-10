@@ -318,6 +318,7 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
         initialize_runtime_state(
             patch_size=self.transformer_config.patch_size,
             warmup_steps=od_config.parallel_config.pipefusion_warmup_steps,
+            split_dim=od_config.parallel_config.pipefusion_split_dim,
         )
 
     @property
@@ -563,6 +564,13 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
         # FIXME: merge it with the runtime state
         self.scheduler.clear_patch_caches()
 
+        # Reset stale PipeFusion caches (KV caches, activation caches) from
+        # previous runs (e.g. the dummy warmup run) to prevent contamination.
+        if self.transformer is not None:
+            self.transformer.pipefusion_reset_caches()
+        if self.transformer_2 is not None:
+            self.transformer_2.pipefusion_reset_caches()
+
         # Denoising via PipeFusion mixin
         num_pipeline_warmup_steps = get_runtime_state().warmup_steps
         # Store original latent dimensions for consistent transformer input across all PP ranks
@@ -696,16 +704,17 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
                 # I2V mode: blend condition with latents using mask
                 latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
-            # Expand timesteps per patch - use floor division to match patch embedding
+            # Expand timesteps per patch — use original_dims (always 5D) since on
+            # non-first stages latents may be 3D tokens (intermediate hidden states).
             patch_size = self.transformer_config.patch_size
-            patch_height = latents.shape[3] // patch_size[1]
-            patch_width = latents.shape[4] // patch_size[2]
+            patch_height = original_dims[3] // patch_size[1]
+            patch_width = original_dims[4] // patch_size[2]
 
             # Create mask at patch resolution (same as hidden states sequence length)
             patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
             patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
             temp_ts = (patch_mask[0][0] * timestep).flatten()
-            timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+            timestep = temp_ts.unsqueeze(0).expand(original_dims[0], -1)
         else:
             # T2V mode: standard forward
             timestep = timestep.expand(original_dims[0])
@@ -718,6 +727,7 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
             "return_dict": False,
             "current_model": current_model,
             "dims": original_dims,
+            "cond": "inputs",
         }
         negative_kwargs = None
         if do_true_cfg:
@@ -729,6 +739,7 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
                 "return_dict": False,
                 "current_model": current_model,
                 "dims": original_dims,
+                "cond": "inputs_uncond",
             }
 
         return positive_kwargs, negative_kwargs
@@ -746,6 +757,7 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
         """
         if current_model is None:
             current_model = self.transformer
+        current_model.cache_key = kwargs.pop("cond")
         return current_model(**kwargs)[0]
 
     def encode_prompt(

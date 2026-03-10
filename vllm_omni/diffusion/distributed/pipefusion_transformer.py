@@ -50,7 +50,7 @@ class PipeFusionTransformerMixin:
         Slice RoPE embeddings for the current pipeline patch.
 
         In patch mode, RoPE is computed for the full spatial extent, then
-        sliced along the height dimension to match the current patch.
+        sliced along the split dimension to match the current patch.
 
         Args:
             rotary_emb: Full RoPE tuple (freqs_cos, freqs_sin).
@@ -60,7 +60,8 @@ class PipeFusionTransformerMixin:
         Returns:
             Sliced RoPE tuple for the current patch.
         """
-        if not get_runtime_state().patch_mode:
+        runtime = get_runtime_state()
+        if not runtime.patch_mode:
             return rotary_emb
 
         p_t, p_h, p_w = patch_size
@@ -68,14 +69,22 @@ class PipeFusionTransformerMixin:
         pph = dims[3] // p_h  # post-patch height (full)
         ppw = dims[4] // p_w  # post-patch width
 
-        pp_heights = get_runtime_state().pp_patches_post_height
-        patch_idx = get_runtime_state().pipeline_patch_idx
+        patch_idx = runtime.pipeline_patch_idx
+
+        if runtime.split_dim == "temporal":
+            # Split along frames (dim=0 in [ppf, pph, ppw])
+            split_dim = 0
+            pp_sizes = runtime.pp_patches_post_frames
+        else:
+            # Split along height (dim=1 in [ppf, pph, ppw])
+            split_dim = 1
+            pp_sizes = runtime.pp_patches_post_height
 
         def split_rope(re):
             # [1, ppf*pph*ppw, 1, dim] -> [ppf, pph, ppw, dim]
             re = re.reshape(ppf, pph, ppw, -1)
-            # Split along height (dim=1) and select current patch
-            re = re.split(pp_heights, dim=1)[patch_idx]
+            # Split along the chosen dimension and select current patch
+            re = re.split(pp_sizes, dim=split_dim)[patch_idx]
             # Reshape back to [1, seq, 1, dim]
             return re.reshape(1, -1, 1, re.shape[-1])
 
@@ -86,20 +95,28 @@ class PipeFusionTransformerMixin:
         """
         Get the post-patch height for the current pipeline stage.
 
-        In patch mode, returns the height of the current patch; otherwise
-        returns the full post-patch height.
-
-        Args:
-            height: Full spatial height.
-            patch_height: Patch size along height dimension.
-
-        Returns:
-            Post-patch height for the current patch or full height.
+        In height-split mode, returns the height of the current patch;
+        in temporal-split mode or non-patch mode, returns the full post-patch height.
         """
-        if get_runtime_state().patch_mode:
-            return get_runtime_state().pp_patches_post_height[get_runtime_state().pipeline_patch_idx]
+        runtime = get_runtime_state()
+        if runtime.patch_mode and runtime.split_dim == "height":
+            return runtime.pp_patches_post_height[runtime.pipeline_patch_idx]
         else:
             return height // patch_height
+
+    @staticmethod
+    def pipefusion_get_post_patch_num_frames(num_frames: int, patch_frames: int) -> int:
+        """
+        Get the post-patch frame count for the current pipeline stage.
+
+        In temporal-split mode, returns the frame count of the current patch;
+        in height-split mode or non-patch mode, returns the full post-patch frame count.
+        """
+        runtime = get_runtime_state()
+        if runtime.patch_mode and runtime.split_dim == "temporal":
+            return runtime.pp_patches_post_frames[runtime.pipeline_patch_idx]
+        else:
+            return num_frames // patch_frames
 
     @staticmethod
     def pipefusion_should_patch_embed() -> bool:
@@ -110,6 +127,20 @@ class PipeFusionTransformerMixin:
     def pipefusion_should_output_project() -> bool:
         """Whether this rank should run output norm/projection/unpatchify (last stage only)."""
         return is_pipeline_last_stage()
+
+    def pipefusion_reset_caches(self) -> None:
+        """
+        Reset all PipeFusion caches (KV caches in attention, activation caches in Conv3d).
+
+        Must be called at the start of each new diffusion request to prevent
+        stale data from a previous run (e.g. the dummy warmup run) from
+        contaminating the current run.
+        """
+        for module in self.modules():
+            if isinstance(module, PipeFusionSelfAttentionMixin):
+                module._kv_caches = {}
+            if isinstance(module, PipeFusionConv3dMixin):
+                module.activation_cache = None
 
     # Class-level attribute: name of the block container to split for PP.
     # Subclasses can override this if their blocks attribute is named differently.
@@ -132,9 +163,9 @@ class PipeFusionTransformerMixin:
 
         num_per_stage = num_blocks // pp_world_size
         remainder = num_blocks % pp_world_size
-        # Give more blocks to later stages (first stage has patch embed overhead)
-        start = pp_rank * num_per_stage + max(0, pp_rank - (pp_world_size - remainder))
-        end = (pp_rank + 1) * num_per_stage + max(0, (pp_rank + 1) - (pp_world_size - remainder))
+        # Give more blocks to earlier stages
+        start = pp_rank * num_per_stage + min(pp_rank, remainder)
+        end = (pp_rank + 1) * num_per_stage + min(pp_rank + 1, remainder)
 
         setattr(self, block_name, blocks[start:end])
         self.pp_layer_offset = start
@@ -184,7 +215,25 @@ class PipeFusionSelfAttentionMixin:
 
     In patch mode, maintains full K/V caches across patches so that
     each patch's query can attend to the full sequence.
+
+    Maintains separate KV caches for conditional ("inputs") and
+    unconditional ("inputs_uncond") predictions to prevent CFG
+    negative predictions from contaminating the conditional cache.
+    The active cache is selected by the parent transformer's
+    ``cache_key`` attribute.
     """
+
+    # Cache dict: cache_key -> (full_k, full_v)
+    _kv_caches: dict[str, tuple[torch.Tensor, torch.Tensor]]
+
+    def _get_kv_cache(self, cache_key: str) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self._kv_caches[cache_key]
+
+    def _set_kv_cache(self, cache_key: str, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Store the KV cache for the given correction key."""
+        if not hasattr(self, "_kv_caches"):
+            self._kv_caches = {}
+        self._kv_caches[cache_key] = (k, v)
 
     def pipefusion_update_kv_cache(
         self,
@@ -197,21 +246,53 @@ class PipeFusionSelfAttentionMixin:
         In patch mode, inserts the current patch's K/V into the full cache
         and returns the full K/V. In non-patch mode, just stores K/V directly.
 
+        Uses the parent transformer's ``cache_key`` to select between
+        separate conditional / unconditional KV caches, preventing the CFG
+        negative prediction from overwriting the conditional cache.
+
+        The token sequence is flattened as [frames, height, width], so
+        height-based patches are NOT contiguous in the flat sequence.
+        We reshape to 5D [B, ppf, pph, ppw, heads, dim] to write
+        at the correct height positions via view-based slicing.
+
         Args:
-            key: Current patch's key tensor.
-            value: Current patch's value tensor.
+            key: Current patch's key tensor [B, patch_seq, heads, dim].
+            value: Current patch's value tensor [B, patch_seq, heads, dim].
 
         Returns:
             (full_key, full_value) for attention computation.
         """
-        if get_runtime_state().patch_mode:
-            start, end = get_runtime_state().pp_patches_token_start_end_idx[get_runtime_state().pipeline_patch_idx]
-            self.full_k[:, start:end] = key
-            self.full_v[:, start:end] = value
-            return self.full_k, self.full_v
+        runtime = get_runtime_state()
+        cache_key = getattr(self, "_parent_cache_key", "inputs")
+
+        if runtime.patch_mode:
+            full_k, full_v = self._get_kv_cache(cache_key)
+            ppf, pph, ppw = runtime.ppf, runtime.pph, runtime.ppw
+            patch_start, patch_end = runtime.pp_patches_post_start_end_idx[runtime.pipeline_patch_idx]
+            B, _, heads, dim = key.shape
+
+            if runtime.split_dim == "temporal":
+                # Temporal split: tokens are contiguous in [f, h, w] order
+                # because frames are the outermost dimension.
+                # Patch covers f∈[f_start, f_end), token range is contiguous.
+                tok_start = patch_start * pph * ppw
+                tok_end = patch_end * pph * ppw
+                full_k[:, tok_start:tok_end] = key
+                full_v[:, tok_start:tok_end] = value
+            else:
+                # Height split: tokens are NON-contiguous (interleaved by frames).
+                # Reshape to 5D [B, ppf, pph, ppw, heads, dim] and slice height.
+                pph_patch = patch_end - patch_start
+                key_5d = key.view(B, ppf, pph_patch, ppw, heads, dim)
+                value_5d = value.view(B, ppf, pph_patch, ppw, heads, dim)
+                full_k_5d = full_k.view(B, ppf, pph, ppw, heads, dim)
+                full_v_5d = full_v.view(B, ppf, pph, ppw, heads, dim)
+                full_k_5d[:, :, patch_start:patch_end, :, :, :] = key_5d
+                full_v_5d[:, :, patch_start:patch_end, :, :, :] = value_5d
+
+            return full_k, full_v
         else:
-            self.full_k = key
-            self.full_v = value
+            self._set_kv_cache(cache_key, key, value)
             return key, value
 
 
@@ -224,14 +305,15 @@ class PipeFusionConv3dMixin:
     """
 
     def pipefusion_conv3d_enabled(self) -> bool:
-        """Whether this conv layer should use PipeFusion patch-wise execution."""
+        """Whether this conv layer should use PipeFusion patch-wise execution.
+
+        Only needed when kernel != stride (overlapping convolutions that
+        require boundary data from neighbouring patches).  When kernel == stride
+        (e.g. the patch embedding), each output position depends on exactly one
+        non-overlapping input block, so the direct conv on the patch is correct.
+        """
         runtime = get_runtime_state()
-        return (
-            runtime.patch_mode
-            and runtime.num_pipeline_patch > 1
-            and self.kernel_size != (1, 1)
-            and self.kernel_size != 1
-        )
+        return runtime.patch_mode and runtime.num_pipeline_patch > 1 and self.kernel_size != self.stride
 
     def pipefusion_conv3d_forward(self, x: torch.Tensor, dims: tuple[int, ...]) -> torch.Tensor:
         """

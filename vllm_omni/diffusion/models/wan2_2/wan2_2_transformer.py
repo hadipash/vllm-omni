@@ -401,8 +401,6 @@ class WanSelfAttention(nn.Module, PipeFusionSelfAttentionMixin):
             causal=False,
         )
 
-        self.full_k, self.full_v = None, None
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -868,6 +866,10 @@ class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
         self.timestep_proj_prepare = TimestepProjPrepare()
         self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
 
+        # PipeFusion: key that selects which KV cache set to use (cond vs uncond).
+        # Set by predict_noise() before each forward pass.
+        self.cache_key = "inputs"
+
     @property
     def dtype(self) -> torch.dtype:
         """Return the dtype of the model parameters."""
@@ -885,7 +887,7 @@ class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
     ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size, _, num_frames, height, width = dims
         p_t, p_h, p_w = self.config.patch_size
-        post_patch_num_frames = num_frames // p_t
+        post_patch_num_frames = self.pipefusion_get_post_patch_num_frames(num_frames, p_t)
         post_patch_height = self.pipefusion_get_post_patch_height(height, p_h)
         post_patch_width = width // p_w
 
@@ -940,6 +942,12 @@ class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
         # if mask is all true, set it to None
         if hidden_states_mask is not None and hidden_states_mask.all():
             hidden_states_mask = None
+
+        # Propagate cache_key to all self-attention modules so they
+        # use the correct KV cache (conditional vs unconditional).
+        for block in self.blocks:
+            # FIXME: do better
+            block.attn1._parent_cache_key = self.cache_key
 
         # Transformer blocks
         for block in self.blocks:

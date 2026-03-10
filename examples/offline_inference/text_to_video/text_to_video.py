@@ -130,6 +130,15 @@ def parse_args() -> argparse.Namespace:
         "During warmup, all ranks process the full latent synchronously. "
         "After warmup, ranks process patches asynchronously for better throughput.",
     )
+    parser.add_argument(
+        "--pipefusion-split-dim",
+        type=str,
+        default="height",
+        choices=["height", "temporal"],
+        help="Dimension along which PipeFusion splits the latent into patches. "
+        "'height' splits the spatial height dimension (default). "
+        "'temporal' splits the frames/temporal dimension.",
+    )
     return parser.parse_args()
 
 
@@ -165,6 +174,7 @@ def main():
         vae_patch_parallel_size=args.vae_patch_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
         pipefusion_warmup_steps=args.pipefusion_warmup_steps,
+        pipefusion_split_dim=args.pipefusion_split_dim,
     )
 
     # Check if profiling is requested via environment variable

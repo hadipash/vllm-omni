@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from vllm.logger import init_logger
 
@@ -18,11 +20,17 @@ class DiTRuntimeState:
     pp_patches_token_num: list[int] | None
     pp_patches_token_start_end_idx: list[tuple[int, int]] | None
 
-    def __init__(self, patch_size: tuple[int, int, int] = (1, 2, 2), warmup_steps: int = 1):
+    def __init__(
+        self,
+        patch_size: tuple[int, int, int] = (1, 2, 2),
+        warmup_steps: int = 1,
+        split_dim: Literal["height", "temporal"] = "height",
+    ):
         self.patch_size = patch_size
         self.patch_mode = False
         self.pipeline_patch_idx = 0
         self.warmup_steps = warmup_steps
+        self.split_dim = split_dim  # "height" or "temporal"
 
     def set_input_parameters(self, latents: torch.Tensor, dtype):
         self._calc_patches_metadata(latents)
@@ -59,20 +67,51 @@ class DiTRuntimeState:
         pph = latents.size(-2) // p_h  # post-patch height (full)
         ppw = latents.size(-1) // p_w  # post-patch width
 
-        # Calculate post-patch heights first (split pph among patches)
-        self.pp_patches_post_height, self.pp_patches_post_start_end_idx = self._calc_patch_metadata(pph)
+        # Store post-patch spatial dims for KV cache reshape in attention
+        self.ppf = ppf
+        self.pph = pph
+        self.ppw = ppw
 
-        # Derive latent-space heights from post-patch heights (multiply by p_h)
-        # This ensures each latent patch height is divisible by p_h
-        self.pp_patches_height = [h * p_h for h in self.pp_patches_post_height]
-        start = 0
-        self.pp_patches_start_end_idx = []
-        for h in self.pp_patches_height:
-            self.pp_patches_start_end_idx.append((start, start + h))
-            start += h
+        if self.split_dim == "height":
+            # Split along spatial height
+            self.latent_split_dim = -2  # dim in 5D [B,C,T,H,W]
 
-        # Token count for each patch based on its post-patch height
-        self.pp_patches_token_num = [h * ppw * ppf for h in self.pp_patches_post_height]
+            # Post-patch heights split among patches
+            self.pp_patches_post_height, self.pp_patches_post_start_end_idx = self._calc_patch_metadata(pph)
+            self.pp_patches_post_frames = None  # not split
+
+            # Latent-space heights (multiply by p_h to ensure divisibility)
+            self.pp_patches_height = [h * p_h for h in self.pp_patches_post_height]
+            start = 0
+            self.pp_patches_start_end_idx = []
+            for h in self.pp_patches_height:
+                self.pp_patches_start_end_idx.append((start, start + h))
+                start += h
+
+            # Token count: each patch covers all frames and widths but partial height
+            self.pp_patches_token_num = [h * ppw * ppf for h in self.pp_patches_post_height]
+
+        elif self.split_dim == "temporal":
+            # Split along temporal (frames) dimension
+            self.latent_split_dim = -3  # dim in 5D [B,C,T,H,W]
+
+            # Post-patch frames split among patches
+            self.pp_patches_post_frames, self.pp_patches_post_start_end_idx = self._calc_patch_metadata(ppf)
+            self.pp_patches_post_height = None  # not split
+
+            # Latent-space frames (multiply by p_t to ensure divisibility)
+            self.pp_patches_height = [f * p_t for f in self.pp_patches_post_frames]
+            start = 0
+            self.pp_patches_start_end_idx = []
+            for f in self.pp_patches_height:
+                self.pp_patches_start_end_idx.append((start, start + f))
+                start += f
+
+            # Token count: each patch covers all heights and widths but partial frames
+            self.pp_patches_token_num = [f * pph * ppw for f in self.pp_patches_post_frames]
+
+        else:
+            raise ValueError(f"Unknown split_dim: {self.split_dim}. Use 'height' or 'temporal'.")
 
         # Calculate start/end indices for each patch's tokens
         start = 0
@@ -86,11 +125,15 @@ class DiTRuntimeState:
         get_pp_group().set_config(dtype)
 
 
-def initialize_runtime_state(patch_size: tuple[int, int, int] = (1, 2, 2), warmup_steps: int = 1):
+def initialize_runtime_state(
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+    warmup_steps: int = 1,
+    split_dim: Literal["height", "temporal"] = "height",
+):
     global _RUNTIME
     if _RUNTIME is not None:
         logger.warning("Runtime state is already initialized, reinitializing with pipeline...")
-    _RUNTIME = DiTRuntimeState(patch_size=patch_size, warmup_steps=warmup_steps)
+    _RUNTIME = DiTRuntimeState(patch_size=patch_size, warmup_steps=warmup_steps, split_dim=split_dim)
 
 
 def get_runtime_state():

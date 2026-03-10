@@ -72,6 +72,11 @@ class DiffusionParallelConfig:
     During warmup, all ranks process the full latent synchronously.
     After warmup, ranks process patches asynchronously for better throughput."""
 
+    pipefusion_split_dim: str = "height"
+    """Dimension along which PipeFusion splits the latent into patches.
+    'height' splits the spatial height dimension (default).
+    'temporal' splits the frames/temporal dimension."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""

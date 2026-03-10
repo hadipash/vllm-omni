@@ -102,15 +102,18 @@ class PipeFusionPipelineMixin(ABC):
         """Initialize async pipeline mode: split latents into patches and set up recv tasks."""
         get_runtime_state().set_patched_mode(patch_mode=True)
 
+        split_sizes = get_runtime_state().pp_patches_height
+        split_dim = get_runtime_state().latent_split_dim
+
         if is_pipeline_first_stage():
             # get latents computed in warmup stage
             # ignore latents after the last timestep
             latents = get_pp_group().pipeline_recv() if get_runtime_state().warmup_steps > 0 else latents
-            patch_latents = list(latents.split(get_runtime_state().pp_patches_height, dim=-2))
+            patch_latents = list(latents.split(split_sizes, dim=split_dim))
         elif is_pipeline_last_stage():
-            patch_latents = list(latents.split(get_runtime_state().pp_patches_height, dim=-2))
+            patch_latents = list(latents.split(split_sizes, dim=split_dim))
             # Split scheduler caches into per-patch versions for async pipeline
-            self.scheduler.split_caches_for_patches(get_runtime_state().pp_patches_height, dim=-2)
+            self.scheduler.split_caches_for_patches(split_sizes, dim=split_dim)
         else:
             patch_latents = [None] * get_runtime_state().num_pipeline_patch
 
@@ -158,7 +161,7 @@ class PipeFusionPipelineMixin(ABC):
             current_guidance_scale = guidance_scale_fn(t)
 
             if is_pipeline_last_stage():
-                last_timestep_latents = latents.to(dtype)
+                last_timestep_latents = latents
 
             # when there is only one pp stage, no need to recv
             if get_pipeline_parallel_world_size() == 1:
@@ -198,7 +201,7 @@ class PipeFusionPipelineMixin(ABC):
                 pass
             elif get_pipeline_parallel_world_size() > 1:
                 if is_pipeline_last_stage():
-                    get_pp_group().pipeline_send(latents)
+                    get_pp_group().pipeline_send(latents.to(dtype))
                 else:
                     get_pp_group().pipeline_send(noise_pred[0])
                     if do_true_cfg:
@@ -245,7 +248,7 @@ class PipeFusionPipelineMixin(ABC):
 
             for patch_idx in range(num_pipeline_patch):
                 if is_pipeline_last_stage():
-                    last_patch_latents[patch_idx] = patch_latents[patch_idx].to(dtype)
+                    last_patch_latents[patch_idx] = patch_latents[patch_idx]
 
                 if is_pipeline_first_stage() and i == 0:
                     pass
@@ -283,7 +286,7 @@ class PipeFusionPipelineMixin(ABC):
                         patch_latents[patch_idx], t, last_patch_latents[patch_idx], do_true_cfg
                     )
                     if i != len(timesteps) - 1:
-                        get_pp_group().pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
+                        get_pp_group().pipeline_isend(patch_latents[patch_idx].to(dtype), segment_idx=patch_idx)
                 else:
                     if do_true_cfg:
                         patch_latents[patch_idx], noise_uncond = patch_latents[patch_idx]
@@ -307,7 +310,7 @@ class PipeFusionPipelineMixin(ABC):
 
         latents = None
         if is_pipeline_last_stage():
-            latents = torch.cat(patch_latents, dim=-2)
+            latents = torch.cat(patch_latents, dim=get_runtime_state().latent_split_dim)
         return latents
 
     @staticmethod
