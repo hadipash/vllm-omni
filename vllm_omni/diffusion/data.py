@@ -628,6 +628,9 @@ class DiffusionOutput:
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+    
+    # DiT backbone execution time (denoising loop only, excluding VAE/prompt encoding)
+    dit_time: float | None = None
 
 
 class AttentionBackendEnum(enum.Enum):

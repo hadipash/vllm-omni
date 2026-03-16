@@ -60,6 +60,7 @@ class OmniRequestOutput:
     latents: torch.Tensor | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
+    dit_time: float | None = None
 
     @classmethod
     def from_pipeline(
@@ -96,6 +97,7 @@ class OmniRequestOutput:
         latents: torch.Tensor | None = None,
         multimodal_output: dict[str, Any] | None = None,
         final_output_type: str = "image",
+        dit_time: float | None = None,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -105,6 +107,7 @@ class OmniRequestOutput:
             prompt: The prompt used
             metrics: Generation metrics
             latents: Optional latent tensors
+            dit_time: DiT backbone execution time
 
         Returns:
             OmniRequestOutput configured for diffusion mode
@@ -116,6 +119,7 @@ class OmniRequestOutput:
             prompt=prompt,
             latents=latents,
             metrics=metrics or {},
+            dit_time=dit_time,
             _multimodal_output=multimodal_output or {},
             finished=True,
         )

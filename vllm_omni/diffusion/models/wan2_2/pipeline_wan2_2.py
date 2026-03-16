@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -601,6 +602,11 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
             first_frame_mask=first_frame_mask,
         )
 
+        # Time DiT backbone execution using CUDA events (non-blocking)
+        dit_start_event = torch.cuda.Event(enable_timing=True)
+        dit_end_event = torch.cuda.Event(enable_timing=True)
+        dit_start_event.record()
+        
         if get_pipeline_parallel_world_size() > 1 and len(timesteps) > num_pipeline_warmup_steps:
             latents = self.pipefusion_sync_pipeline(
                 timesteps=timesteps[:num_pipeline_warmup_steps],
@@ -628,6 +634,8 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
                 sync_only=True,
                 **extra_kwargs,
             )
+        
+        dit_end_event.record()
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
@@ -669,7 +677,11 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
                 latents = latents / latents_std + latents_mean
                 output = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=output)
+        # Compute DiT time from CUDA events (converts ms to seconds)
+        # Called at the end to avoid blocking VAE decode - allows GPU overlap
+        dit_time = dit_start_event.elapsed_time(dit_end_event) / 1000.0
+
+        return DiffusionOutput(output=output, dit_time=dit_time)
 
     def prepare_pipefusion_noise_kwargs(
         self,

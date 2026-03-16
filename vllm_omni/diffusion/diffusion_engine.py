@@ -88,6 +88,7 @@ class DiffusionEngine:
                     prompt=prompt,
                     metrics={},
                     latents=None,
+                    dit_time=output.dit_time,
                 )
                 for i, prompt in enumerate(request.prompts)
             ]
@@ -127,6 +128,7 @@ class DiffusionEngine:
                         latents=output.trajectory_latents,
                         multimodal_output={"audio": audio_payload},
                         final_output_type="audio",
+                        dit_time=output.dit_time,
                     ),
                 ]
             else:
@@ -137,6 +139,7 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        dit_time=output.dit_time,
                     ),
                 ]
         else:
@@ -164,6 +167,7 @@ class DiffusionEngine:
                             latents=output.trajectory_latents,
                             multimodal_output={"audio": audio_payload},
                             final_output_type="audio",
+                            dit_time=output.dit_time,
                         )
                     )
                 else:
@@ -174,6 +178,7 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
+                            dit_time=output.dit_time,
                         )
                     )
 

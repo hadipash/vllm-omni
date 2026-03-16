@@ -139,6 +139,11 @@ def parse_args() -> argparse.Namespace:
         "'height' splits the spatial height dimension (default). "
         "'temporal' splits the frames/temporal dimension.",
     )
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Benchmark pipeline by running execution 5 times.",
+    )
     return parser.parse_args()
 
 
@@ -214,35 +219,72 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
+    times = []
+    dit_times = []
     current_omni_platform.empty_cache()
     monitor = GPUMemoryMonitor(device_index=torch.cuda.current_device(), interval=0.02)
-    monitor.start()
-    generation_start = time.perf_counter()
-    frames = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-        },
-        OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            generator=generator,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_high,
-            num_inference_steps=args.num_inference_steps,
-            num_frames=args.num_frames,
-        ),
-    )
-    generation_end = time.perf_counter()
-    generation_time = generation_end - generation_start
-    peak = monitor.peak_used_mb
-    monitor.stop()
+    n = 1
+    if args.bench:
+        current_omni_platform.synchronize()
+        n = 5
+    for i in range(n):
+        if i == 0:
+            monitor.start()
+        generation_start = time.perf_counter()
+        frames = omni.generate(
+            {
+                "prompt": args.prompt,
+                "negative_prompt": args.negative_prompt,
+            },
+            OmniDiffusionSamplingParams(
+                height=args.height,
+                width=args.width,
+                generator=generator,
+                guidance_scale=args.guidance_scale,
+                guidance_scale_2=args.guidance_scale_high,
+                num_inference_steps=args.num_inference_steps,
+                num_frames=args.num_frames,
+            ),
+        )
+        if args.bench:
+            current_omni_platform.synchronize()
+        generation_end = time.perf_counter()
+        generation_time = generation_end - generation_start
+        times.append(generation_time)
+        
+        # Extract DiT time from output
+        dit_time = None
+        if isinstance(frames, list) and len(frames) > 0:
+            first_item = frames[0]
+            if hasattr(first_item, "is_pipeline_output") and first_item.is_pipeline_output:
+                if isinstance(first_item.request_output, list) and len(first_item.request_output) > 0:
+                    inner_output = first_item.request_output[0]
+                    if hasattr(inner_output, "dit_time"):
+                        dit_time = inner_output.dit_time
+            elif hasattr(first_item, "dit_time"):
+                dit_time = first_item.dit_time
+        if dit_time is not None:
+            dit_times.append(dit_time)
+        
+        if i == 0:
+            peak = monitor.peak_used_mb
+            monitor.stop()
+    if args.bench:
+        times = times[1:]  # drop warm-up step
+        dit_times = dit_times[1:]  # drop warm-up step
+    generation_time = sum(times) / len(times)
+    dit_time_avg = sum(dit_times) / len(dit_times) if dit_times else None
 
     # Print profiling results
     print(
         f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)"
         f" | Peak memory usage: {peak:.2f} MB"
     )
+    if dit_time_avg is not None:
+        print(
+            f"DiT backbone time: {dit_time_avg:.4f} seconds ({dit_time_avg * 1000:.2f} ms)"
+            f" | Overhead (VAE/embedding): {(generation_time - dit_time_avg):.4f} seconds"
+        )
 
     # Extract video frames from OmniRequestOutput
     if isinstance(frames, list) and len(frames) > 0:
