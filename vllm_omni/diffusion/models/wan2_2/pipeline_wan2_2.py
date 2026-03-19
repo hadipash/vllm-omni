@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import datetime
 import json
 import os
-import time
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -13,6 +14,7 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -353,6 +355,7 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
+        enable_profiling: bool = False,
         **kwargs,
     ) -> DiffusionOutput:
         # Get parameters from request or arguments
@@ -606,35 +609,60 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
         dit_start_event = torch.cuda.Event(enable_timing=True)
         dit_end_event = torch.cuda.Event(enable_timing=True)
         dit_start_event.record()
-        
-        if get_pipeline_parallel_world_size() > 1 and len(timesteps) > num_pipeline_warmup_steps:
-            latents = self.pipefusion_sync_pipeline(
-                timesteps=timesteps[:num_pipeline_warmup_steps],
-                latents=latents,
-                dtype=dtype,
-                do_true_cfg_fn=do_true_cfg_fn,
-                guidance_scale_fn=guidance_scale_fn,
-                **extra_kwargs,
-            )
-            latents = self.pipefusion_async_pipeline(
-                timesteps=timesteps[num_pipeline_warmup_steps:],
-                latents=latents,
-                dtype=dtype,
-                do_true_cfg_fn=do_true_cfg_fn,
-                guidance_scale_fn=guidance_scale_fn,
-                **extra_kwargs,
+
+        # Set up profiler if enabled
+        if enable_profiling:
+            profiler_context = profile(
+                activities=[ProfilerActivity.CUDA],
+                schedule=schedule(
+                    skip_first=num_pipeline_warmup_steps,
+                    wait=0,
+                    warmup=3,
+                    active=len(timesteps) - num_pipeline_warmup_steps - 3,
+                    repeat=1,
+                ),
+                on_trace_ready=tensorboard_trace_handler(
+                    f"./logs/pipefusion/pp{get_pipeline_parallel_world_size()}/{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
+                ),
             )
         else:
-            latents = self.pipefusion_sync_pipeline(
-                timesteps=timesteps,
-                latents=latents,
-                dtype=dtype,
-                do_true_cfg_fn=do_true_cfg_fn,
-                guidance_scale_fn=guidance_scale_fn,
-                sync_only=True,
-                **extra_kwargs,
-            )
-        
+            profiler_context = contextlib.nullcontext()
+
+        with profiler_context as profiler:
+            if get_pipeline_parallel_world_size() > 1 and len(timesteps) > num_pipeline_warmup_steps:
+                latents = self.pipefusion_sync_pipeline(
+                    timesteps=timesteps[:num_pipeline_warmup_steps],
+                    latents=latents,
+                    dtype=dtype,
+                    do_true_cfg_fn=do_true_cfg_fn,
+                    guidance_scale_fn=guidance_scale_fn,
+                    **extra_kwargs,
+                )
+                if enable_profiling:
+                    profiler.step()
+                latents = self.pipefusion_async_pipeline(
+                    timesteps=timesteps[num_pipeline_warmup_steps:],
+                    latents=latents,
+                    dtype=dtype,
+                    do_true_cfg_fn=do_true_cfg_fn,
+                    guidance_scale_fn=guidance_scale_fn,
+                    profiler=profiler if enable_profiling else None,
+                    **extra_kwargs,
+                )
+            else:
+                latents = self.pipefusion_sync_pipeline(
+                    timesteps=timesteps,
+                    latents=latents,
+                    dtype=dtype,
+                    do_true_cfg_fn=do_true_cfg_fn,
+                    guidance_scale_fn=guidance_scale_fn,
+                    sync_only=True,
+                    **extra_kwargs,
+                )
+
+        if enable_profiling:
+            print(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
         dit_end_event.record()
 
         # Wan2.2 is prone to out of memory errors when predicting large videos

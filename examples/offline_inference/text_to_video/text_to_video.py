@@ -144,6 +144,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Benchmark pipeline by running execution 5 times.",
     )
+    parser.add_argument(
+        "--enable-profiling",
+        action="store_true",
+        help="Enable PyTorch profiler for performance analysis. Generates TensorBoard traces in ./logs/ directory.",
+    )
     return parser.parse_args()
 
 
@@ -223,12 +228,13 @@ def main():
     dit_times = []
     current_omni_platform.empty_cache()
     monitor = GPUMemoryMonitor(device_index=torch.cuda.current_device(), interval=0.02)
+    peak = 0
     n = 1
     if args.bench:
         current_omni_platform.synchronize()
         n = 5
     for i in range(n):
-        if i == 0:
+        if i == 0 and not args.enable_profiling:
             monitor.start()
         generation_start = time.perf_counter()
         frames = omni.generate(
@@ -244,6 +250,7 @@ def main():
                 guidance_scale_2=args.guidance_scale_high,
                 num_inference_steps=args.num_inference_steps,
                 num_frames=args.num_frames,
+                enable_profiling=args.enable_profiling,
             ),
         )
         if args.bench:
@@ -251,7 +258,7 @@ def main():
         generation_end = time.perf_counter()
         generation_time = generation_end - generation_start
         times.append(generation_time)
-        
+
         # Extract DiT time from output
         dit_time = None
         if isinstance(frames, list) and len(frames) > 0:
@@ -265,8 +272,8 @@ def main():
                 dit_time = first_item.dit_time
         if dit_time is not None:
             dit_times.append(dit_time)
-        
-        if i == 0:
+
+        if i == 0 and not args.enable_profiling:
             peak = monitor.peak_used_mb
             monitor.stop()
     if args.bench:

@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -216,6 +217,7 @@ class PipeFusionPipelineMixin(ABC):
         dtype: torch.dtype,
         do_true_cfg_fn: Any,
         guidance_scale_fn: Any,
+        profiler: Any = None,
         **extra_kwargs: Any,
     ) -> torch.Tensor | None:
         """
@@ -235,7 +237,9 @@ class PipeFusionPipelineMixin(ABC):
         if len(timesteps) == 0:
             return latents
         num_pipeline_patch = get_runtime_state().num_pipeline_patch
-        patch_latents = self._init_async_pipeline(num_timesteps=len(timesteps), latents=latents)
+        num_pipeline_warmup_steps = get_runtime_state().warmup_steps
+        with nvtx.range("async_init"):
+            patch_latents = self._init_async_pipeline(num_timesteps=len(timesteps), latents=latents)
         last_patch_latents = [None] * num_pipeline_patch if is_pipeline_last_stage() else None
         noise_uncond = None
 
@@ -253,60 +257,70 @@ class PipeFusionPipelineMixin(ABC):
                 if is_pipeline_first_stage() and i == 0:
                     pass
                 else:
-                    if first_async_recv:
-                        if do_true_cfg and not is_pipeline_first_stage():
+                    with nvtx.range(f"async_recv_get{i + num_pipeline_warmup_steps}"):
+                        if first_async_recv:
+                            if do_true_cfg and not is_pipeline_first_stage():
+                                get_pp_group().recv_next()
                             get_pp_group().recv_next()
-                        get_pp_group().recv_next()
-                        first_async_recv = False
+                            first_async_recv = False
 
-                    if do_true_cfg and not is_pipeline_first_stage():
-                        noise_uncond = get_pp_group().get_pipeline_recv_data(idx=patch_idx, name="noise_uncond")
-                    patch_latents[patch_idx] = get_pp_group().get_pipeline_recv_data(idx=patch_idx)
+                        if do_true_cfg and not is_pipeline_first_stage():
+                            noise_uncond = get_pp_group().get_pipeline_recv_data(idx=patch_idx, name="noise_uncond")
+                        patch_latents[patch_idx] = get_pp_group().get_pipeline_recv_data(idx=patch_idx)
 
-                positive_kwargs, negative_kwargs = self.prepare_pipefusion_noise_kwargs(
-                    latents=patch_latents[patch_idx].to(dtype),
-                    timestep=t,
-                    do_true_cfg=do_true_cfg,
-                    noise_uncond=noise_uncond,
-                    **extra_kwargs,
-                )
+                with nvtx.range(f"async_computation_{i + num_pipeline_warmup_steps}"):
+                    positive_kwargs, negative_kwargs = self.prepare_pipefusion_noise_kwargs(
+                        latents=patch_latents[patch_idx].to(dtype),
+                        timestep=t,
+                        do_true_cfg=do_true_cfg,
+                        noise_uncond=noise_uncond,
+                        **extra_kwargs,
+                    )
 
-                # Predict noise with automatic CFG parallel handling
-                patch_latents[patch_idx] = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=current_guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
+                    # Predict noise with automatic CFG parallel handling
+                    patch_latents[patch_idx] = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=current_guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
 
                 if is_pipeline_last_stage():
                     # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                    patch_latents[patch_idx] = self.scheduler_step_maybe_with_cfg(
-                        patch_latents[patch_idx], t, last_patch_latents[patch_idx], do_true_cfg
-                    )
+                    with nvtx.range(f"async_computation_scheduler_{i + num_pipeline_warmup_steps}"):
+                        patch_latents[patch_idx] = self.scheduler_step_maybe_with_cfg(
+                            patch_latents[patch_idx], t, last_patch_latents[patch_idx], do_true_cfg
+                        )
                     if i != len(timesteps) - 1:
-                        get_pp_group().pipeline_isend(patch_latents[patch_idx].to(dtype), segment_idx=patch_idx)
+                        with nvtx.range(f"async_send_{i + num_pipeline_warmup_steps}"):
+                            get_pp_group().pipeline_isend(patch_latents[patch_idx].to(dtype), segment_idx=patch_idx)
                 else:
-                    if do_true_cfg:
-                        patch_latents[patch_idx], noise_uncond = patch_latents[patch_idx]
-                        get_pp_group().pipeline_isend(noise_uncond, name="noise_uncond", segment_idx=patch_idx)
-                    get_pp_group().pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
+                    with nvtx.range(f"async_send_{i + num_pipeline_warmup_steps}"):
+                        if do_true_cfg:
+                            patch_latents[patch_idx], noise_uncond = patch_latents[patch_idx]
+                            get_pp_group().pipeline_isend(noise_uncond, name="noise_uncond", segment_idx=patch_idx)
+                        get_pp_group().pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
 
                 if is_pipeline_first_stage() and i == 0:
                     pass
                 else:
-                    if i == len(timesteps) - 1 and patch_idx == num_pipeline_patch - 1:
-                        pass
-                    elif is_pipeline_first_stage():
-                        get_pp_group().recv_next()
-                    else:
-                        # recv noise_uncond
-                        get_pp_group().recv_next()
-                        # recv latents
-                        get_pp_group().recv_next()
+                    with nvtx.range(f"async_recv_next{i + num_pipeline_warmup_steps}"):
+                        if i == len(timesteps) - 1 and patch_idx == num_pipeline_patch - 1:
+                            pass
+                        elif is_pipeline_first_stage():
+                            get_pp_group().recv_next()
+                        else:
+                            # recv noise_uncond
+                            get_pp_group().recv_next()
+                            # recv latents
+                            get_pp_group().recv_next()
 
                 get_runtime_state().next_patch()
+
+            # Step profiler after each timestep if profiling is enabled
+            if profiler is not None:
+                profiler.step()
 
         latents = None
         if is_pipeline_last_stage():

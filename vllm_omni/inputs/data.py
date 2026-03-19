@@ -271,6 +271,7 @@ class OmniDiffusionSamplingParams:
     # profile
     profile: bool = False
     num_profiled_timesteps: int = 8
+    enable_profiling: bool = False
 
     # debugging
     debug: bool = False
