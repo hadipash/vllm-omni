@@ -577,6 +577,8 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
 
         # Denoising via PipeFusion mixin
         num_pipeline_warmup_steps = get_runtime_state().warmup_steps
+        use_pipeline_parallel = get_pipeline_parallel_world_size() > 1
+        no_intermediate_warmup = self.od_config.parallel_config.pipefusion_no_intermediate_warmup
         # Store original latent dimensions for consistent transformer input across all PP ranks
         # After patch_embedding on first rank, latents become [B, seq, dim], but transformer
         # needs original [B, C, T, H, W] dims to compute post_patch dimensions correctly
@@ -629,36 +631,62 @@ class Wan22Pipeline(nn.Module, PipeFusionPipelineMixin, CFGParallelMixin):
             profiler_context = contextlib.nullcontext()
 
         with profiler_context as profiler:
-            if get_pipeline_parallel_world_size() > 1 and len(timesteps) > num_pipeline_warmup_steps:
-                latents = self.pipefusion_sync_pipeline(
-                    timesteps=timesteps[:num_pipeline_warmup_steps],
-                    latents=latents,
-                    dtype=dtype,
-                    do_true_cfg_fn=do_true_cfg_fn,
-                    guidance_scale_fn=guidance_scale_fn,
-                    **extra_kwargs,
-                )
-                if enable_profiling:
-                    profiler.step()
-                latents = self.pipefusion_async_pipeline(
-                    timesteps=timesteps[num_pipeline_warmup_steps:],
-                    latents=latents,
-                    dtype=dtype,
-                    do_true_cfg_fn=do_true_cfg_fn,
-                    guidance_scale_fn=guidance_scale_fn,
-                    profiler=profiler if enable_profiling else None,
-                    **extra_kwargs,
-                )
-            else:
-                latents = self.pipefusion_sync_pipeline(
-                    timesteps=timesteps,
-                    latents=latents,
+            def _run_pipefusion_phase(phase_timesteps: torch.Tensor, phase_latents: torch.Tensor | None):
+                if len(phase_timesteps) == 0:
+                    return phase_latents
+
+                if use_pipeline_parallel and len(phase_timesteps) > num_pipeline_warmup_steps:
+                    phase_latents = self.pipefusion_sync_pipeline(
+                        timesteps=phase_timesteps[:num_pipeline_warmup_steps],
+                        latents=phase_latents,
+                        dtype=dtype,
+                        do_true_cfg_fn=do_true_cfg_fn,
+                        guidance_scale_fn=guidance_scale_fn,
+                        **extra_kwargs,
+                    )
+                    if enable_profiling:
+                        profiler.step()
+                    phase_latents = self.pipefusion_async_pipeline(
+                        timesteps=phase_timesteps[num_pipeline_warmup_steps:],
+                        latents=phase_latents,
+                        dtype=dtype,
+                        do_true_cfg_fn=do_true_cfg_fn,
+                        guidance_scale_fn=guidance_scale_fn,
+                        profiler=profiler if enable_profiling else None,
+                        **extra_kwargs,
+                    )
+                    return phase_latents
+
+                return self.pipefusion_sync_pipeline(
+                    timesteps=phase_timesteps,
+                    latents=phase_latents,
                     dtype=dtype,
                     do_true_cfg_fn=do_true_cfg_fn,
                     guidance_scale_fn=guidance_scale_fn,
                     sync_only=True,
                     **extra_kwargs,
                 )
+
+            transformer_switch_idx = None
+            if use_pipeline_parallel and self.transformer is not None and self.transformer_2 is not None:
+                for idx, timestep in enumerate(timesteps):
+                    if boundary_timestep is not None and timestep < boundary_timestep:
+                        transformer_switch_idx = idx
+                        break
+
+            if (
+                not no_intermediate_warmup
+                and transformer_switch_idx is not None
+                and 0 < transformer_switch_idx < len(timesteps)
+            ):
+                latents = _run_pipefusion_phase(timesteps[:transformer_switch_idx], latents)
+                latents = self.pipefusion_send_output_to_first_rank(latents)
+                self.scheduler.merge_caches_from_patches(dim=get_runtime_state().latent_split_dim)
+                if self.transformer_2 is not None:
+                    self.transformer_2.pipefusion_reset_caches()
+                latents = _run_pipefusion_phase(timesteps[transformer_switch_idx:], latents)
+            else:
+                latents = _run_pipefusion_phase(timesteps, latents)
 
         if enable_profiling:
             print(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=10))

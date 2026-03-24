@@ -322,6 +322,7 @@ class PipeFusionPipelineMixin(ABC):
             if profiler is not None:
                 profiler.step()
 
+        get_runtime_state().set_patched_mode(patch_mode=False)
         latents = None
         if is_pipeline_last_stage():
             latents = torch.cat(patch_latents, dim=get_runtime_state().latent_split_dim)

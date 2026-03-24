@@ -140,6 +140,11 @@ def parse_args() -> argparse.Namespace:
         "'temporal' splits the frames/temporal dimension.",
     )
     parser.add_argument(
+        "--pipefusion-no-intermediate-warmup",
+        action="store_true",
+        help="Skip the sync phase at transformer switch. `transformer_2` starts from zero-initialized KV caches (output quality may degrade).",
+    )
+    parser.add_argument(
         "--bench",
         action="store_true",
         help="Benchmark pipeline by running execution 5 times.",
@@ -185,6 +190,7 @@ def main():
         pipeline_parallel_size=args.pipeline_parallel_size,
         pipefusion_warmup_steps=args.pipefusion_warmup_steps,
         pipefusion_split_dim=args.pipefusion_split_dim,
+        pipefusion_no_intermediate_warmup=args.pipefusion_no_intermediate_warmup,
     )
 
     # Check if profiling is requested via environment variable
@@ -219,7 +225,8 @@ def main():
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
         f" vae_patch_parallel_size={args.vae_patch_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size},"
-        f" pipefusion_warmup_steps={args.pipefusion_warmup_steps}"
+        f" pipefusion_warmup_steps={args.pipefusion_warmup_steps},"
+        f" pipefusion_no_intermediate_warmup={args.pipefusion_no_intermediate_warmup}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")

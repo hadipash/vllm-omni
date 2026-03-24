@@ -227,7 +227,9 @@ class PipeFusionSelfAttentionMixin:
     _kv_caches: dict[str, tuple[torch.Tensor, torch.Tensor]]
 
     def _get_kv_cache(self, cache_key: str) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        return self._kv_caches[cache_key]
+        if not hasattr(self, "_kv_caches"):
+            self._kv_caches = {}
+        return self._kv_caches.get(cache_key, (None, None))
 
     def _set_kv_cache(self, cache_key: str, k: torch.Tensor, v: torch.Tensor) -> None:
         """Store the KV cache for the given correction key."""
@@ -270,6 +272,12 @@ class PipeFusionSelfAttentionMixin:
             ppf, pph, ppw = runtime.ppf, runtime.pph, runtime.ppw
             patch_start, patch_end = runtime.pp_patches_post_start_end_idx[runtime.pipeline_patch_idx]
             B, _, heads, dim = key.shape
+
+            if full_k is None or full_v is None:
+                full_seq_len = ppf * pph * ppw
+                full_k = torch.zeros(B, full_seq_len, heads, dim, dtype=key.dtype, device=key.device)
+                full_v = torch.zeros(B, full_seq_len, heads, dim, dtype=value.dtype, device=value.device)
+                self._set_kv_cache(cache_key, full_k, full_v)
 
             if runtime.split_dim == "temporal":
                 # Temporal split: tokens are contiguous in [f, h, w] order

@@ -117,6 +117,34 @@ class PipeFusionSchedulerMixin:
         """Clear per-patch caches when exiting async pipeline mode."""
         self._pf_patch_caches = None
 
+    def merge_caches_from_patches(self, dim: int = -2) -> None:
+        if self._pf_patch_caches is None:
+            return
+
+        for attr_name, cache_type in self._pipefusion_patch_cache_spec:
+            if attr_name not in self._pf_patch_caches:
+                continue
+
+            value = self._pf_patch_caches[attr_name]
+
+            if cache_type == "list":
+                merged_value = []
+                num_items = len(value[0]) if value else 0
+                for item_idx in range(num_items):
+                    patch_values = [patch_value[item_idx] for patch_value in value]
+                    if patch_values[0] is None:
+                        merged_value.append(None)
+                    else:
+                        merged_value.append(torch.cat(patch_values, dim=dim))
+                setattr(self, attr_name, merged_value)
+            elif cache_type == "tensor":
+                if not value or value[0] is None:
+                    setattr(self, attr_name, None)
+                else:
+                    setattr(self, attr_name, torch.cat(value, dim=dim))
+
+        self._pf_patch_caches = None
+
     def pipefusion_step_begin(self) -> tuple[int, bool]:
         """
         Begin a scheduler step: get patch context and load per-patch state.

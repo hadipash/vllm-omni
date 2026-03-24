@@ -77,6 +77,10 @@ class DiffusionParallelConfig:
     'height' splits the spatial height dimension (default).
     'temporal' splits the frames/temporal dimension."""
 
+    pipefusion_no_intermediate_warmup: bool = False
+    """Skip the sync phase when switching from transformer to transformer_2 (e.g., in Wan 2.2 14B).
+    In this mode, transformer_2 starts from zero-initialized KV caches. This may reduce output quality."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
@@ -89,6 +93,9 @@ class DiffusionParallelConfig:
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.cfg_parallel_size in [1, 2], f"CFG parallel size must be 1 or 2, but got {self.cfg_parallel_size}"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
+        assert self.pipefusion_split_dim in ["height", "temporal"], (
+            "pipefusion_split_dim must be either 'height' or 'temporal'"
+        )
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
