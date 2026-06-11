@@ -184,6 +184,10 @@ class VideoGenerationRequest(BaseModel):
         default=None,
         description="Per-request PipeFusion latent split dimension.",
     )
+    enable_rotational_pipefusion: bool | None = Field(
+        default=None,
+        description="Enable rotational PipeFusion patch rotation and skipping for this request.",
+    )
 
     # vllm-omni extensions for post-generation frame interpolation.
     enable_frame_interpolation: bool = Field(

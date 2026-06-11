@@ -308,6 +308,7 @@ class OmniDiffusionSamplingParams:
     # PipeFusion runtime settings
     pipefusion_warmup_steps: int | None = None
     pipefusion_split_dim: Literal["height", "temporal"] | None = None
+    enable_rotational_pipefusion: bool | None = None
 
     # stage logging
     # logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)

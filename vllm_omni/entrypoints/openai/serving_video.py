@@ -160,6 +160,8 @@ class OmniOpenAIServingVideo:
             gen_params.pipefusion_warmup_steps = request.pipefusion_warmup_steps
         if "pipefusion_split_dim" in provided_fields:
             gen_params.pipefusion_split_dim = request.pipefusion_split_dim
+        if "enable_rotational_pipefusion" in provided_fields:
+            gen_params.enable_rotational_pipefusion = request.enable_rotational_pipefusion
         if "boundary_ratio" in provided_fields and request.boundary_ratio is not None:
             gen_params.boundary_ratio = request.boundary_ratio
 

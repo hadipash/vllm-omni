@@ -49,7 +49,7 @@ class PipeFusionSchedulerMixin:
         "this_order",
     ]
 
-    # Shared list/tensor attributes that should only be updated on the first patch (patch_idx == 0)
+    # Shared list/tensor attributes that should only be updated on the first patch in the current processing order.
     _pipefusion_first_patch_only_attrs: ClassVar[list[str]] = ["timestep_list"]
 
     def __init_subclass__(cls, **kwargs):
@@ -79,7 +79,7 @@ class PipeFusionSchedulerMixin:
 
     def _pipefusion_scheduler_step(self, step: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Run a scheduler step with PipeFusion patch-state bookkeeping."""
-        patch_idx, is_last_patch = self._step_begin()
+        is_first_patch, is_last_patch = self._step_begin()
 
         # Snapshot shared state to restore if not last patch
         shared_snapshots = {}
@@ -88,9 +88,9 @@ class PipeFusionSchedulerMixin:
                 val = getattr(self, attr)
                 shared_snapshots[attr] = val.clone() if isinstance(val, torch.Tensor) else val
 
-        # Snapshot first-patch-only state to restore if patch_idx > 0
+        # Snapshot first-patch-only state to restore if this is not the first patch in processing order.
         first_patch_snapshots = {}
-        if patch_idx > 0:
+        if not is_first_patch:
             for attr in getattr(self, "_pipefusion_first_patch_only_attrs", []):
                 if hasattr(self, attr):
                     val = getattr(self, attr)
@@ -115,8 +115,8 @@ class PipeFusionSchedulerMixin:
             for attr, val in shared_snapshots.items():
                 setattr(self, attr, val)
 
-        # Restore first-patch-only state if patch_idx > 0
-        if patch_idx > 0:
+        # Restore first-patch-only state if this is not the first patch in processing order.
+        if not is_first_patch:
             for attr, val in first_patch_snapshots.items():
                 setattr(self, attr, val)
 
@@ -170,7 +170,7 @@ class PipeFusionSchedulerMixin:
         """Clear per-patch caches when exiting async pipeline mode."""
         self._pf_patch_caches = None
 
-    def _step_begin(self) -> tuple[int, bool]:
+    def _step_begin(self) -> tuple[bool, bool]:
         """
         Begin a scheduler step: get patch context and load per-patch state.
 
@@ -178,22 +178,18 @@ class PipeFusionSchedulerMixin:
         In patch mode, swaps cached attributes to the current patch's versions.
 
         Returns:
-            (patch_idx, is_last_patch) tuple:
-            - patch_idx: Current patch index (0 if not in patch mode).
-            - is_last_patch: Whether this is the last patch in the sequence.
+            - is_first_patch: Whether this is the first patch in processing order.
+            - is_last_patch: Whether this is the last patch in processing order.
         """
         runtime_state = get_pipefusion_runtime()
-
-        patch_idx, is_last_patch = 0, True
         if runtime_state.patch_mode and self._pf_patch_caches is not None:
             patch_idx = runtime_state.pipeline_patch_idx
-            is_last_patch = patch_idx == runtime_state.num_pipeline_patch - 1
 
             for attr_name, _ in self._pipefusion_patch_cache_spec:
                 if attr_name in self._pf_patch_caches:
                     setattr(self, attr_name, self._pf_patch_caches[attr_name][patch_idx])
 
-        return patch_idx, is_last_patch
+        return runtime_state.is_first_patch, runtime_state.is_last_patch
 
     def _update_value(self, attr_name: str, value: Any) -> None:
         """

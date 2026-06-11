@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
@@ -187,6 +187,7 @@ class PipelineParallelMixin:
         output_slice: int | None = None,
         skip_sync: bool = False,
         inter_comm_ids: list[str] | None = None,
+        intermediate_tensors: list[AsyncIntermediateTensors] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """
         Drop-in replacement for predict_noise_maybe_with_cfg that also handles PP.
@@ -236,7 +237,12 @@ class PipelineParallelMixin:
             raise ValueError(f"inter_comm_ids has length {len(inter_comm_ids)} but expected {n}")
         its: list[AsyncIntermediateTensors | None] = [None] * n
         if not pp_group.is_first_rank:
-            its = [AsyncIntermediateTensors(*pp_group.irecv_tensor_dict(comm_id=inter_comm_ids[i])) for i in range(n)]
+            if intermediate_tensors is not None:
+                if len(intermediate_tensors) != n:
+                    raise ValueError(f"intermediate_tensors has length {len(intermediate_tensors)} but expected {n}")
+                its = intermediate_tensors.copy()
+            else:
+                its = [AsyncIntermediateTensors(*pp_group.irecv_tensor_dict(comm_id=inter_comm_ids[i])) for i in range(n)]
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.

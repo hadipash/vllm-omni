@@ -18,7 +18,11 @@ from typing import Literal
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel_world_size, get_pp_group
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pipeline_parallel_rank,
+    get_pipeline_parallel_world_size,
+    get_pp_group,
+)
 
 logger = init_logger(__name__)
 
@@ -28,6 +32,9 @@ _PF_RUNTIME: PipeFusionRuntime | None = None
 class PipeFusionRuntime:
     patch_mode: bool
     pipeline_patch_idx: int
+    use_rotational_pipefusion: bool
+    is_first_patch: bool
+    is_last_patch: bool
     pp_patches_height: list[int] | None
     pp_patches_start_end_idx: list[tuple[int, int]] | None
     pp_patches_token_num: list[int] | None
@@ -37,6 +44,9 @@ class PipeFusionRuntime:
         self.patch_size: tuple[int, int, int] = (1, 2, 2)
         self.patch_mode = False
         self.pipeline_patch_idx = 0
+        self.use_rotational_pipefusion = False
+        self.is_first_patch = True
+        self.is_last_patch = True
         self.warmup_steps = 1
         self.split_dim: Literal["height", "temporal"] = "height"
         self.cache_key: Literal["inputs", "inputs_uncond"] = "inputs"
@@ -53,7 +63,12 @@ class PipeFusionRuntime:
             raise ValueError(f"Invalid PipeFusion cache key: {key!r}. Must be 'inputs' or 'inputs_uncond'.")
         self.cache_key = key
 
-    def set_run_config(self, warmup_steps: int | None = None, split_dim: str | None = None) -> None:
+    def set_run_config(
+        self,
+        warmup_steps: int | None = None,
+        split_dim: str | None = None,
+        use_rotational_pipefusion: bool | None = None,
+    ) -> None:
         if warmup_steps is not None:
             if not isinstance(warmup_steps, int) or warmup_steps < 1:
                 raise ValueError(f"PipeFusion warmup_steps must be a positive integer, got {warmup_steps!r}.")
@@ -62,15 +77,23 @@ class PipeFusionRuntime:
             if split_dim not in ("height", "temporal"):
                 raise ValueError(f"Invalid PipeFusion split_dim: {split_dim!r}. Must be 'height' or 'temporal'.")
             self.split_dim = split_dim
+        if use_rotational_pipefusion is not None:
+            self.use_rotational_pipefusion = use_rotational_pipefusion
 
     def set_patched_mode(self, patch_mode: bool):
         self.patch_mode = patch_mode
         self.pipeline_patch_idx = 0
+        self.is_first_patch = True
+        self.is_last_patch = not patch_mode or self.num_pipeline_patch == 1
         if hasattr(self, "patch_idx_tensor"):
             self.patch_idx_tensor.fill_(0)
 
-    def next_patch(self):
-        if self.patch_mode:
+    def next_patch(
+        self, patch_idx: int | None = None, is_first_patch: bool | None = None, is_last_patch: bool | None = None
+    ):
+        if patch_idx is not None:
+            self.pipeline_patch_idx = patch_idx
+        elif self.patch_mode:
             self.pipeline_patch_idx += 1
             if self.pipeline_patch_idx == self.num_pipeline_patch:
                 self.pipeline_patch_idx = 0
@@ -78,6 +101,15 @@ class PipeFusionRuntime:
             self.pipeline_patch_idx = 0
         if hasattr(self, "patch_idx_tensor"):
             self.patch_idx_tensor.fill_(self.pipeline_patch_idx)
+
+        self.is_first_patch = (
+            (not self.patch_mode or self.pipeline_patch_idx == 0) if is_first_patch is None else is_first_patch
+        )
+        self.is_last_patch = (
+            (not self.patch_mode or self.pipeline_patch_idx == self.num_pipeline_patch - 1)
+            if is_last_patch is None
+            else is_last_patch
+        )
 
     def _calc_patch_metadata(self, seq_length):
         lengths = [seq_length // self.num_pipeline_patch] * (self.num_pipeline_patch - 1)
@@ -155,6 +187,22 @@ class PipeFusionRuntime:
         for num in self.pp_patches_token_num:
             self.pp_patches_token_start_end_idx.append((start, start + num))
             start += num
+
+    def get_initial_patch_indices(self) -> list[int]:
+        patch_indices = list(range(self.num_pipeline_patch))
+        if self.use_rotational_pipefusion:
+            shift = get_pipeline_parallel_rank() % self.num_pipeline_patch
+            patch_indices = patch_indices[-shift:] + patch_indices[:-shift]
+        return patch_indices
+
+    def get_last_stage_patch_indices(self, timestep_idx: int) -> list[int]:
+        patch_indices = list(range(self.num_pipeline_patch))
+        if self.use_rotational_pipefusion:
+            shift = (get_pipeline_parallel_world_size() - 1) % self.num_pipeline_patch
+            patch_indices = patch_indices[-shift:] + patch_indices[:-shift]
+            for _ in range(timestep_idx):
+                patch_indices = patch_indices[-1:] + patch_indices[:-1]
+        return patch_indices
 
     def _reset_recv_buffer(self, dtype):
         get_pp_group().reset_buffer()
